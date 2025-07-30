@@ -64,7 +64,7 @@ class LunarisCodexConfig:
     # --- MoC Params ---
     n_experts: Optional[int] = 8 # Example: 8 experts
     top_k: int = 2 # For Collaborative Experts, this is often > 1
-    aux_loss_weight: float = 1e-2 # Global weight for the auxiliary loss
+    aux_loss_weight: float = 0.1 # Global weight for the auxiliary loss
     router_temperature: float = 1.0 # MODIFIED: Added router temperature parameter
 
 # Pre-existing functions (precompute_freqs_cis, apply_rotary_emb) remain unchanged.
@@ -224,7 +224,7 @@ class CollaborativeExpertsModule(nn.Module):
             cross_attn_weights * torch.log(cross_attn_weights + 1e-8),
             dim=-1
         ).mean()
-        diversity_loss = -attn_entropy
+        diversity_loss = attn_entropy
 
         # Expert usage balance loss (minimize variance of usage)
         expert_usage = routing_probs.mean(dim=[0, 1])
