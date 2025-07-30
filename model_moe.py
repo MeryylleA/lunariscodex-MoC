@@ -49,6 +49,7 @@ class LunarisCodexConfig:
         n_experts: Total number of experts in the MoC layer. If None, uses standard FFN.
         top_k: Number of experts to route each token to.
         aux_loss_weight: Multiplier for the auxiliary collaboration and balance loss.
+        router_temperature: Temperature for scaling router logits before softmax.
     """
     d_model: int = 768
     n_layers: int = 12
@@ -64,6 +65,7 @@ class LunarisCodexConfig:
     n_experts: Optional[int] = 8 # Example: 8 experts
     top_k: int = 2 # For Collaborative Experts, this is often > 1
     aux_loss_weight: float = 1e-2 # Global weight for the auxiliary loss
+    router_temperature: float = 1.0 # MODIFIED: Added router temperature parameter
 
 # Pre-existing functions (precompute_freqs_cis, apply_rotary_emb) remain unchanged.
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
@@ -172,6 +174,7 @@ class CollaborativeExpertsModule(nn.Module):
         self.n_experts = config.n_experts
         self.top_k = config.top_k
         self.aux_loss_weight = config.aux_loss_weight
+        self.router_temperature = config.router_temperature # MODIFIED: Added router temperature
 
         # Expert networks (using the model's standard FeedForward class)
         self.experts = nn.ModuleList([
@@ -256,10 +259,20 @@ class CollaborativeExpertsModule(nn.Module):
         token_summary = contextualized_experts.mean(dim=1)
         routing_logits = self.router_gate(token_summary).view(batch_size, seq_len, self.n_experts)
 
-        # Step 3: Top-K Expert Selection
+        # --- MODIFICATION START ---
+        # Step 3: Top-K Expert Selection with Temperature and Stable Softmax
+        # Apply temperature scaling to the logits
+        routing_logits = routing_logits / self.router_temperature
+
+        # Get top-k logits and their indices
+        top_k_logits, top_k_indices = torch.topk(routing_logits, self.top_k, dim=-1)
+
+        # Apply softmax to the selected top-k logits for numerically stable probabilities
+        top_k_probs = F.softmax(top_k_logits, dim=-1, dtype=torch.float32)
+        
+        # Calculate routing probabilities over all experts *after* temperature scaling for the aux loss
         routing_probs = F.softmax(routing_logits, dim=-1, dtype=torch.float32)
-        top_k_probs, top_k_indices = torch.topk(routing_probs, self.top_k, dim=-1)
-        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        # --- MODIFICATION END ---
 
         # Step 4: Gather selected expert outputs
         batch_indices = torch.arange(batch_size).view(-1, 1, 1).expand(-1, seq_len, self.top_k)
