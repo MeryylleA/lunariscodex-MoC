@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LunarisCodex-MoC | Evolving Mixture of Experts through Collaboration</title>
+    <meta name="description" content="A novel Large Language Model architecture with Mixture of Collaborative Experts (MoC) - where AI experts collaborate instead of compete.">
+    
+    <!-- Tailwind CSS via CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        
+        /* Custom gradients */
+        .gradient-bg {
+            background: linear-gradient(135deg, #1a202c 0%, #2d3748 50%, #1a202c 100%);
+        }
+        
+        .code-highlight {
+            background: linear-gradient(90deg, #2d3748 0%, #4a5568 100%);
+        }
+        
+        /* Smooth animations */
+        .fade-in-up {
+            animation: fadeInUp 0.8s ease-out forwards;
+            opacity: 0;
+            transform: translateY(30px);
+        }
+        
+        @keyframes fadeInUp {
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        /* SVG animations */
+        .svg-animate {
+            animation: pulse 2s ease-in-out infinite alternate;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        
+        /* Hover effects */
+        .hover-glow:hover {
+            box-shadow: 0 0 20px rgba(59, 130, 246, 0.3);
+            transition: box-shadow 0.3s ease;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-100 leading-relaxed">
+    
+    <!-- Header/Navigation -->
+    <header class="fixed top-0 w-full bg-gray-900/95 backdrop-blur-sm border-b border-gray-800 z-50">
+        <nav class="container mx-auto px-6 py-4">
+            <div class="flex justify-between items-center">
+                <div class="font-mono font-bold text-xl text-blue-400">
+                    LunarisCodex-MoC
+                </div>
+                <div class="hidden md:flex space-x-8">
+                    <a href="#overview" class="hover:text-blue-400 transition-colors">Overview</a>
+                    <a href="#architecture" class="hover:text-blue-400 transition-colors">Architecture</a>
+                    <a href="#analysis" class="hover:text-blue-400 transition-colors">Analysis</a>
+                    <a href="#code" class="hover:text-blue-400 transition-colors">Code</a>
+                </div>
+                <div class="md:hidden">
+                    <button id="mobile-menu-btn" class="text-gray-300 hover:text-blue-400">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </nav>
+    </header>
+
+    <!-- Mobile menu -->
+    <div id="mobile-menu" class="fixed inset-0 bg-gray-900/95 z-40 hidden">
+        <div class="flex flex-col items-center justify-center h-full space-y-8 text-xl">
+            <a href="#overview" class="mobile-menu-link hover:text-blue-400 transition-colors">Overview</a>
+            <a href="#architecture" class="mobile-menu-link hover:text-blue-400 transition-colors">Architecture</a>
+            <a href="#analysis" class="mobile-menu-link hover:text-blue-400 transition-colors">Analysis</a>
+            <a href="#code" class="mobile-menu-link hover:text-blue-400 transition-colors">Code</a>
+        </div>
+    </div>
+
+    <!-- Hero Section -->
+    <section class="gradient-bg min-h-screen flex items-center justify-center pt-20">
+        <div class="container mx-auto px-6 text-center">
+            <div class="fade-in-up">
+                <h1 class="text-5xl md:text-7xl font-bold mb-6 bg-gradient-to-r from-blue-400 via-purple-500 to-emerald-400 bg-clip-text text-transparent">
+                    LunarisCodex-MoC
+                </h1>
+                <p class="text-xl md:text-2xl text-gray-300 mb-12 max-w-3xl mx-auto">
+                    <em>Evolving Mixture of Experts through Collaboration</em>
+                </p>
+            </div>
+            
+            <!-- Main Architecture SVG Diagram -->
+            <div class="fade-in-up max-w-5xl mx-auto mb-12" style="animation-delay: 0.3s">
+                <svg viewBox="0 0 800 400" class="w-full h-auto">
+                    <!-- Input token -->
+                    <rect x="50" y="180" width="80" height="40" rx="20" fill="#3B82F6" class="svg-animate"/>
+                    <text x="90" y="205" text-anchor="middle" fill="white" class="text-sm font-mono">Input x</text>
+                    
+                    <!-- Arrow from input to experts -->
+                    <path d="M130 200 L180 200" stroke="#64748B" stroke-width="2" marker-end="url(#arrowhead)"/>
+                    
+                    <!-- N Experts (Initial Processing) -->
+                    <g transform="translate(200, 120)">
+                        <rect x="0" y="0" width="60" height="30" rx="5" fill="#10B981" opacity="0.8"/>
+                        <text x="30" y="20" text-anchor="middle" fill="white" class="text-xs">Expert 1</text>
+                        
+                        <rect x="0" y="40" width="60" height="30" rx="5" fill="#10B981" opacity="0.8"/>
+                        <text x="30" y="60" text-anchor="middle" fill="white" class="text-xs">Expert 2</text>
+                        
+                        <rect x="0" y="80" width="60" height="30" rx="5" fill="#10B981" opacity="0.8"/>
+                        <text x="30" y="100" text-anchor="middle" fill="white" class="text-xs">Expert 3</text>
+                        
+                        <text x="30" y="130" text-anchor="middle" fill="#64748B" class="text-xs">⋮</text>
+                        
+                        <rect x="0" y="140" width="60" height="30" rx="5" fill="#10B981" opacity="0.8"/>
+                        <text x="30" y="160" text-anchor="middle" fill="white" class="text-xs">Expert N</text>
+                    </g>
+                    
+                    <!-- Arrow to Router Contextualization -->
+                    <path d="M280 200 L320 200" stroke="#64748B" stroke-width="2" marker-end="url(#arrowhead)"/>
+                    
+                    <!-- Router Contextualization (Self-Attention) -->
+                    <g transform="translate(340, 160)">
+                        <rect x="0" y="0" width="120" height="80" rx="10" fill="#8B5CF6" opacity="0.9"/>
+                        <text x="60" y="25" text-anchor="middle" fill="white" class="text-sm font-semibold">Router</text>
+                        <text x="60" y="40" text-anchor="middle" fill="white" class="text-sm">Contextualization</text>
+                        <text x="60" y="60" text-anchor="middle" fill="white" class="text-xs">(Self-Attention)</text>
+                        
+                        <!-- Self-attention symbol -->
+                        <circle cx="60" cy="70" r="8" fill="none" stroke="white" stroke-width="1"/>
+                        <path d="M52 70 L68 70 M60 62 L60 78" stroke="white" stroke-width="1"/>
+                    </g>
+                    
+                    <!-- Arrow to Top-K Selection -->
+                    <path d="M480 200 L520 200" stroke="#64748B" stroke-width="2" marker-end="url(#arrowhead)"/>
+                    
+                    <!-- Selected K Experts -->
+                    <g transform="translate(540, 150)">
+                        <rect x="0" y="10" width="60" height="30" rx="5" fill="#F59E0B" opacity="0.9"/>
+                        <text x="30" y="30" text-anchor="middle" fill="white" class="text-xs">Expert A</text>
+                        
+                        <rect x="0" y="50" width="60" height="30" rx="5" fill="#F59E0B" opacity="0.9"/>
+                        <text x="30" y="70" text-anchor="middle" fill="white" class="text-xs">Expert B</text>
+                        
+                        <text x="30" y="100" text-anchor="middle" fill="#64748B" class="text-xs">⋮ (k selected)</text>
+                    </g>
+                    
+                    <!-- Arrow to Collaborative Fusion -->
+                    <path d="M620 200 L660 200" stroke="#64748B" stroke-width="2" marker-end="url(#arrowhead)"/>
+                    
+                    <!-- Collaborative Fusion (Cross-Attention) -->
+                    <g transform="translate(680, 160)">
+                        <rect x="0" y="0" width="120" height="80" rx="10" fill="#EF4444" opacity="0.9"/>
+                        <text x="60" y="25" text-anchor="middle" fill="white" class="text-sm font-semibold">Collaborative</text>
+                        <text x="60" y="40" text-anchor="middle" fill="white" class="text-sm">Fusion</text>
+                        <text x="60" y="60" text-anchor="middle" fill="white" class="text-xs">(Cross-Attention)</text>
+                        
+                        <!-- Cross-attention symbol -->
+                        <g transform="translate(60, 70)">
+                            <circle cx="0" cy="0" r="8" fill="none" stroke="white" stroke-width="1"/>
+                            <path d="M-6 -6 L6 6 M6 -6 L-6 6" stroke="white" stroke-width="1"/>
+                        </g>
+                    </g>
+                    
+                    <!-- Arrow to output -->
+                    <path d="M800 200 L840 200" stroke="#64748B" stroke-width="2" marker-end="url(#arrowhead)"/>
+                    
+                    <!-- Output -->
+                    <rect x="850" y="180" width="80" height="40" rx="20" fill="#3B82F6" class="svg-animate"/>
+                    <text x="890" y="205" text-anchor="middle" fill="white" class="text-sm font-mono">Output y</text>
+                    
+                    <!-- Arrow marker definition -->
+                    <defs>
+                        <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                            <polygon points="0 0, 10 3.5, 0 7" fill="#64748B"/>
+                        </marker>
+                    </defs>
+                    
+                    <!-- Labels -->
+                    <text x="400" y="120" text-anchor="middle" fill="#64748B" class="text-sm font-semibold">
+                        Complete Data Flow: Input → All Experts → Router Contextualization → Top-K Selection → Collaborative Fusion → Output
+                    </text>
+                </svg>
+            </div>
+            
+            <div class="fade-in-up" style="animation-delay: 0.6s">
+                <p class="text-lg text-gray-400 max-w-4xl mx-auto">
+                    A revolutionary Large Language Model architecture where AI experts collaborate through self-attention and cross-attention mechanisms, transforming isolated specialists into a collaborative team.
+                </p>
+            </div>
+        </div>
+    </section>
+
+    <!-- Overview Section: The Ministers Analogy -->
+    <section id="overview" class="py-20 bg-gray-800">
+        <div class="container mx-auto px-6">
+            <div class="text-center mb-16">
+                <h2 class="text-4xl font-bold mb-6 text-blue-400">The Core Idea: An Analogy</h2>
+                <p class="text-xl text-gray-400 max-w-3xl mx-auto">
+                    Understanding the difference between traditional MoE and our collaborative MoC through the story of two governments
+                </p>
+            </div>
+            
+            <div class="grid md:grid-cols-2 gap-12 max-w-6xl mx-auto">
+                <!-- Traditional MoE: The Overwhelmed President -->
+                <div class="bg-gray-900 rounded-xl p-8 border border-gray-700 hover-glow">
+                    <div class="text-center mb-8">
+                        <div class="w-16 h-16 mx-auto mb-4 bg-red-500/20 rounded-full flex items-center justify-center">
+                            <svg class="w-8 h-8 text-red-400" fill="currentColor" viewBox="0 0 20 20">
+                                <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd"/>
+                            </svg>
+                        </div>
+                        <h3 class="text-2xl font-bold text-red-400 mb-2">Standard MoE</h3>
+                        <p class="text-gray-400">The Overwhelmed President</p>
+                    </div>
+                    
+                    <div class="space-y-4 text-gray-300">
+                        <div class="flex items-start space-x-3">
+                            <span class="text-red-400 font-bold">1.</span>
+                            <p><strong>Quick Decision:</strong> President sees "Economy vs. Environment" and thinks: "80% Economy, 20% Environment"</p>
+                        </div>
+                        <div class="flex items-start space-x-3">
+                            <span class="text-red-400 font-bold">2.</span>
+                            <p><strong>Simple Selection:</strong> Calls only Economy and Environment ministers</p>
+                        </div>
+                        <div class="flex items-start space-x-3">
+                            <span class="text-red-400 font-bold">3.</span>
+                            <p><strong>Isolated Work:</strong> Each minister works alone in their office</p>
+                        </div>
+                        <div class="flex items-start space-x-3">
+                            <span class="text-red-400 font-bold">4.</span>
+                            <p><strong>Mechanical Fusion:</strong> Takes 80% Economy + 20% Environment ideas</p>
+                        </div>
+                        <div class="flex items-start space-x-3">
+                            <span class="text-red-400 font-bold">⚠️</span>
+                            <p><strong>The Problem:</strong> Contradictory policies that don't work together</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- MoC: The Wise President -->
+                <div class="bg-gray-900 rounded-xl p-8 border border-emerald-500/30 hover-glow">
+                    <div class="text-center mb-8">
+                        <div class="w-16 h-16 mx-auto mb-4 bg-emerald-500/20 rounded-full flex items-center justify-center">
+                            <svg class="w-8 h-8 text-emerald-400" fill="currentColor" viewBox="0 0 20 20">
+                                <path d="M13 6a3 3 0 11-6 0 3 3 0 016 0zM18 8a2 2 0 11-4 0 2 2 0 014 0zM14 15a4 4 0 00-8 0v3h8v-3zM6 8a2 2 0 11-4 0 2 2 0 014 0zM16 18v-3a5.972 5.972 0 00-.75-2.906A3.005 3.005 0 0119 15v3h-3zM4.75 12.094A5.973 5.973 0 004 15v3H1v-3a3 3 0 013.75-2.906z"/>
+                            </svg>
+                        </div>
+                        <h3 class="text-2xl font-bold text-emerald-400 mb-2">MoC Architecture</h3>
+                        <p class="text-gray-400">The Wise President</p>
+                    </div>
+                    
+                    <div class="space-y-6 text-gray-300">
+                        <div>
+                            <h4 class="text-emerald-400 font-semibold mb-3">Phase 1: Router Contextualization</h4>
+                            <div class="space-y-2 ml-4">
+                                <div class="flex items-start space-x-3">
+                                    <span class="text-emerald-400 font-bold">1.</span>
+                                    <p>Sends report to <strong>ALL 8 ministers</strong> for initial analysis</p>
+                                </div>
+                                <div class="flex items-start space-x-3">
+                                    <span class="text-emerald-400 font-bold">2.</span>
+                                    <p><strong>Preliminary Meeting:</strong> All ministers share insights and connections</p>
+                                </div>
+                                <div class="flex items-start space-x-3">
+                                    <span class="text-emerald-400 font-bold">3.</span>
+                                    <p><strong>Informed Decision:</strong> Realizes need for Foreign Relations too → selects 3 ministers</p>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div>
+                            <h4 class="text-emerald-400 font-semibold mb-3">Phase 2: Collaborative Fusion</h4>
+                            <div class="space-y-2 ml-4">
+                                <div class="flex items-start space-x-3">
+                                    <span class="text-emerald-400 font-bold">4.</span>
+                                    <p><strong>Task Force Meeting:</strong> Selected ministers collaborate in real-time</p>
+                                </div>
+                                <div class="flex items-start space-x-3">
+                                    <span class="text-emerald-400 font-bold">5.</span>
+                                    <p><strong>Refinement:</strong> Each refines their proposal based on others' input</p>
+                                </div>
+                                <div class="flex items-start space-x-3">
+                                    <span class="text-emerald-400 font-bold">✨</span>
+                                    <p><strong>Result:</strong> Integrated policy that's economically viable, environmentally responsible, and internationally aligned</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="text-center mt-16">
+                <div class="bg-blue-500/10 border border-blue-500/20 rounded-xl p-8 max-w-4xl mx-auto">
+                    <h4 class="text-2xl font-bold text-blue-400 mb-4">The Evolution: From Competition to Collaboration</h4>
+                    <p class="text-lg text-gray-300 leading-relaxed">
+                        Traditional MoE models route tokens to isolated experts who work independently. MoC transforms this paradigm: 
+                        experts now <strong>collaborate through attention mechanisms</strong>, sharing insights and refining their outputs together. 
+                        The result is not just better performance, but a more intelligent, context-aware decision-making process.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Architecture Deep Dive -->
+    <section id="architecture" class="py-20 bg-gray-900">
+        <div class="container mx-auto px-6">
+            <div class="text-center mb-16">
+                <h2 class="text-4xl font-bold mb-6 text-purple-400">Architectural Deep Dive</h2>
+                <p class="text-xl text-gray-400 max-w-3xl mx-auto">
+                    The technical innovations that make collaborative expertise possible
+                </p>
+            </div>
+            
+            <!-- Router Contextualization -->
+            <div class="mb-20">
+                <div class="grid lg:grid-cols-2 gap-12 items-center">
+                    <div>
+                        <h3 class="text-3xl font-bold text-purple-400 mb-6">1. Router Contextualization</h3>
+                        <div class="space-y-4 text-gray-300">
+                            <div class="bg-red-500/10 border-l-4 border-red-500 pl-4">
+                                <p class="text-red-400 font-semibold">The Problem:</p>
+                                <p>Standard MoE routers make blind decisions based only on input tokens, without knowing what different experts "think" about that input.</p>
+                            </div>
+                            <div class="bg-emerald-500/10 border-l-4 border-emerald-500 pl-4">
+                                <p class="text-emerald-400 font-semibold">The MoC Solution:</p>
+                                <ol class="list-decimal list-inside space-y-2 mt-2">
+                                    <li>Send input to <strong>ALL experts</strong> in parallel</li>
+                                    <li>Apply <strong>self-attention</strong> over expert outputs</li>
+                                    <li>Make informed top-k routing decisions</li>
+                                </ol>
+                            </div>
+                        </div>
+                        
+                        <!-- Code snippet -->
+                        <div class="mt-6 code-highlight rounded-lg p-4 border border-gray-700">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="text-xs text-gray-400 font-mono">Python</span>
+                                <span class="text-xs text-purple-400">Router Contextualization</span>
+                            </div>
+                            <pre class="text-sm text-gray-300 font-mono overflow-x-auto"><code># Self-attention over ALL expert outputs
+contextualized_experts, _ = self.router_self_attn(
+    expert_flat, expert_flat, expert_flat
+)
+
+# Generate informed routing scores
+token_summary = contextualized_experts.mean(dim=1)
+routing_logits = self.router_gate(token_summary)</code></pre>
+                        </div>
+                    </div>
+                    
+                    <!-- Router Contextualization Diagram -->
+                    <div class="bg-gray-800 rounded-xl p-6 border border-gray-700">
+                        <svg viewBox="0 0 400 300" class="w-full h-auto">
+                            <!-- Input Token -->
+                            <rect x="50" y="20" width="60" height="25" rx="12" fill="#3B82F6"/>
+                            <text x="80" y="37" text-anchor="middle" fill="white" class="text-xs">Token</text>
+                            
+                            <!-- Arrows to all experts -->
+                            <path d="M80 45 L80 80" stroke="#64748B" stroke-width="2" marker-end="url(#arrowhead-small)"/>
+                            <path d="M80 80 L40 100" stroke="#64748B" stroke-width="1"/>
+                            <path d="M80 80 L80 100" stroke="#64748B" stroke-width="1"/>
+                            <path d="M80 80 L120 100" stroke="#64748B" stroke-width="1"/>
+                            
+                            <!-- All Experts -->
+                            <rect x="20" y="100" width="40" height="20" rx="3" fill="#10B981" opacity="0.8"/>
+                            <text x="40" y="112" text-anchor="middle" fill="white" class="text-xs">E1</text>
+                            
+                            <rect x="70" y="100" width="40" height="20" rx="3" fill="#10B981" opacity="0.8"/>
+                            <text x="90" y="112" text-anchor="middle" fill="white" class="text-xs">E2</text>
+                            
+                            <rect x="120" y="100" width="40" height="20" rx="3" fill="#10B981" opacity="0.8"/>
+                            <text x="140" y="112" text-anchor="middle" fill="white" class="text-xs">EN</text>
+                            
+                            <!-- Arrows to self-attention -->
+                            <path d="M40 120 L80 150" stroke="#64748B" stroke-width="1"/>
+                            <path d="M90 120 L80 150" stroke="#64748B" stroke-width="1"/>
+                            <path d="M140 120 L80 150" stroke="#64748B" stroke-width="1"/>
+                            
+                            <!-- Self-Attention Block -->
+                            <rect x="30" y="150" width="100" height="40" rx="8" fill="#8B5CF6"/>
+                            <text x="80" y="165" text-anchor="middle" fill="white" class="text-sm font-semibold">Self-Attention</text>
+                            <text x="80" y="180" text-anchor="middle" fill="white" class="text-xs">over Expert Outputs</text>
+                            
+                            <!-- Arrow to router -->
+                            <path d="M80 190 L80 220" stroke="#64748B" stroke-width="2" marker-end="url(#arrowhead-small)"/>
+                            
+                            <!-- Router -->
+                            <rect x="30" y="220" width="100" height="30" rx="6" fill="#F59E0B"/>
+                            <text x="80" y="238" text-anchor="middle" fill="white" class="text-sm font-semibold">Informed Router</text>
+                            
+                            <!-- Arrow to selection -->
+                            <path d="M130 235 L180 235" stroke="#64748B" stroke-width="2" marker-end="url(#arrowhead-small)"/>
+                            
+                            <!-- Top-K Selection -->
+                            <g transform="translate(200, 215)">
+                                <rect x="0" y="0" width="40" height="20" rx="3" fill="#EF4444"/>
+                                <text x="20" y="12" text-anchor="middle" fill="white" class="text-xs">Top-K</text>
+                                <rect x="0" y="25" width="40" height="20" rx="3" fill="#EF4444"/>
+                                <text x="20" y="37" text-anchor="middle" fill="white" class="text-xs">Selected</text>
+                            </g>
+                            
+                            <defs>
+                                <marker id="arrowhead-small" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+                                    <polygon points="0 0, 8 3, 0 6" fill="#64748B"/>
+                                </marker>
+                            </defs>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Collaborative Fusion -->
+            <div>
+                <div class="grid lg:grid-cols-2 gap-12 items-center">
+                    <!-- Collaborative Fusion Diagram -->
+                    <div class="bg-gray-800 rounded-xl p-6 border border-gray-700 lg:order-1">
+                        <svg viewBox="0 0 400 300" class="w-full h-auto">
+                            <!-- Selected Experts -->
+                            <g transform="translate(50, 50)">
+                                <rect x="0" y="0" width="60" height="25" rx="5" fill="#F59E0B"/>
+                                <text x="30" y="15" text-anchor="middle" fill="white" class="text-xs">Expert A</text>
+                                
+                                <rect x="80" y="0" width="60" height="25" rx="5" fill="#F59E0B"/>
+                                <text x="110" y="15" text-anchor="middle" fill="white" class="text-xs">Expert B</text>
+                                
+                                <rect x="160" y="0" width="60" height="25" rx="5" fill="#F59E0B"/>
+                                <text x="190" y="15" text-anchor="middle" fill="white" class="text-xs">Expert K</text>
+                            </g>
+                            
+                            <!-- Arrows to cross-attention -->
+                            <path d="M80 75 L110 120" stroke="#64748B" stroke-width="1"/>
+                            <path d="M140 75 L140 120" stroke="#64748B" stroke-width="1"/>
+                            <path d="M220 75 L170 120" stroke="#64748B" stroke-width="1"/>
+                            
+                            <!-- Cross-Attention Block -->
+                            <rect x="70" y="120" width="120" height="50" rx="10" fill="#EF4444"/>
+                            <text x="130" y="135" text-anchor="middle" fill="white" class="text-sm font-semibold">Cross-Attention</text>
+                            <text x="130" y="150" text-anchor="middle" fill="white" class="text-xs">Experts Collaborate</text>
+                            
+                            <!-- Cross-attention visualization -->
+                            <g transform="translate(130, 160)">
+                                <circle cx="0" cy="0" r="8" fill="none" stroke="white" stroke-width="1.5"/>
+                                <path d="M-6 -6 L6 6 M6 -6 L-6 6" stroke="white" stroke-width="1.5"/>
+                            </g>
+                            
+                            <!-- Arrow to refinement -->
+                            <path d="M130 170 L130 200" stroke="#64748B" stroke-width="2" marker-end="url(#arrowhead-small)"/>
+                            
+                            <!-- Refinement FFN -->
+                            <rect x="70" y="200" width="120" height="30" rx="6" fill="#06B6D4"/>
+                            <text x="130" y="218" text-anchor="middle" fill="white" class="text-sm font-semibold">Refinement FFN</text>
+                            
+                            <!-- Arrow to output -->
+                            <path d="M130 230 L130 260" stroke="#64748B" stroke-width="2" marker-end="url(#arrowhead-small)"/>
+                            
+                            <!-- Collaborative Output -->
+                            <rect x="80" y="260" width="100" height="25" rx="12" fill="#3B82F6"/>
+                            <text x="130" y="275" text-anchor="middle" fill="white" class="text-xs">Collaborative Output</text>
+                        </svg>
+                    </div>
+                    
+                    <div class="lg:order-2">
+                        <h3 class="text-3xl font-bold text-red-400 mb-6">2. Collaborative Fusion</h3>
+                        <div class="space-y-4 text-gray-300">
+                            <div class="bg-red-500/10 border-l-4 border-red-500 pl-4">
+                                <p class="text-red-400 font-semibold">The Problem:</p>
+                                <p>Standard MoE with k > 1 simply combines expert outputs with weighted sums. No real collaboration happens.</p>
+                            </div>
+                            <div class="bg-emerald-500/10 border-l-4 border-emerald-500 pl-4">
+                                <p class="text-emerald-400 font-semibold">The MoC Solution:</p>
+                                <ol class="list-decimal list-inside space-y-2 mt-2">
+                                    <li>Selected experts enter a "meeting room"</li>
+                                    <li><strong>Cross-attention</strong> enables expert-to-expert communication</li>
+                                    <li>Each expert refines based on others' perspectives</li>
+                                    <li>Weighted combination of refined outputs</li>
+                                </ol>
+                            </div>
+                        </div>
+                        
+                        <!-- Code snippet -->
+                        <div class="mt-6 code-highlight rounded-lg p-4 border border-gray-700">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="text-xs text-gray-400 font-mono">Python</span>
+                                <span class="text-xs text-red-400">Collaborative Fusion</span>
+                            </div>
+                            <pre class="text-sm text-gray-300 font-mono overflow-x-auto"><code># Cross-attention between selected experts
+collaborative_outputs, collab_attn = self.collab_cross_attn(
+    selected_flat, selected_flat, selected_flat
+)
+
+# Refinement with residual connection
+refined_outputs = self.collab_ffn(collaborative_outputs) + collaborative_outputs
+
+# Final weighted combination
+final_output = (refined_outputs * top_k_probs.unsqueeze(-1)).sum(dim=2)</code></pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Advanced Auxiliary Loss -->
+            <div class="mt-20">
+                <div class="bg-gray-800 rounded-xl p-8 border border-gray-700">
+                    <h3 class="text-2xl font-bold text-yellow-400 mb-6 text-center">Advanced Auxiliary Loss</h3>
+                    <div class="grid md:grid-cols-2 gap-8">
+                        <div>
+                            <h4 class="text-lg font-semibold text-yellow-400 mb-3">Diversity Loss</h4>
+                            <p class="text-gray-300 mb-4">Maximizes entropy of cross-attention patterns to encourage rich collaboration patterns and prevent expert collapse.</p>
+                            <div class="bg-gray-900 rounded p-3 font-mono text-sm text-gray-300">
+                                <code>diversity_loss = -attn_entropy</code>
+                            </div>
+                        </div>
+                        <div>
+                            <h4 class="text-lg font-semibold text-yellow-400 mb-3">Balance Loss</h4>
+                            <p class="text-gray-300 mb-4">Minimizes variance in expert usage to ensure all experts contribute and prevent some from being ignored.</p>
+                            <div class="bg-gray-900 rounded p-3 font-mono text-sm text-gray-300">
+                                <code>balance_loss = torch.var(expert_usage)</code>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Technical Analysis -->
+    <section id="analysis" class="py-20 bg-gray-800">
+        <div class="container mx-auto px-6">
+            <div class="text-center mb-16">
+                <h2 class="text-4xl font-bold mb-6 text-emerald-400">Technical Analysis</h2>
+                <p class="text-xl text-gray-400 max-w-3xl mx-auto">
+                    Performance characteristics, computational complexity, and architectural advantages
+                </p>
+            </div>
+            
+            <div class="max-w-6xl mx-auto">
+                <!-- Computational Complexity -->
+                <div class="bg-gray-900 rounded-xl p-8 mb-12 border border-gray-700">
+                    <h3 class="text-2xl font-bold text-emerald-400 mb-6">Computational Complexity Analysis</h3>
+                    
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left">
+                            <thead>
+                                <tr class="border-b border-gray-700">
+                                    <th class="py-3 px-4 text-emerald-400 font-semibold">Component</th>
+                                    <th class="py-3 px-4 text-emerald-400 font-semibold">Traditional MoE</th>
+                                    <th class="py-3 px-4 text-emerald-400 font-semibold">MoC (Our Implementation)</th>
+                                </tr>
+                            </thead>
+                            <tbody class="text-gray-300">
+                                <tr class="border-b border-gray-700/50">
+                                    <td class="py-3 px-4 font-mono">Expert Computation</td>
+                                    <td class="py-3 px-4">O(B × S × top_k × d_model²)</td>
+                                    <td class="py-3 px-4 text-yellow-400">O(B × S × n_experts × d_model²)</td>
+                                </tr>
+                                <tr class="border-b border-gray-700/50">
+                                    <td class="py-3 px-4 font-mono">Router Self-Attention</td>
+                                    <td class="py-3 px-4">—</td>
+                                    <td class="py-3 px-4 text-blue-400">O(B × S × n_experts² × d_model)</td>
+                                </tr>
+                                <tr class="border-b border-gray-700/50">
+                                    <td class="py-3 px-4 font-mono">Cross-Attention</td>
+                                    <td class="py-3 px-4">—</td>
+                                    <td class="py-3 px-4 text-purple-400">O(B × S × top_k² × d_model)</td>
+                                </tr>
+                                <tr>
+                                    <td class="py-3 px-4 font-mono font-bold">Total Complexity</td>
+                                    <td class="py-3 px-4 font-bold">O(B × S × top_k × d_model²)</td>
+                                    <td class="py-3 px-4 font-bold text-red-400">O(B × S × n_experts × d_model²)</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <div class="mt-6 bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4">
+                        <p class="text-yellow-400 font-semibold mb-2">Trade-off Analysis:</p>
+                        <p class="text-gray-300">
+                            MoC has higher computational cost during training (processes all experts), but this enables much richer collaboration. 
+                            The expert computation dominates overall complexity, making the additional attention mechanisms a worthwhile investment for improved quality.
+                        </p>
+                    </div>
+                </div>
+                
+                <!-- Key Advantages -->
+                <div class="grid md:grid-cols-2 gap-8 mb-12">
+                    <div class="bg-gray-900 rounded-xl p-8 border border-emerald-500/30">
+                        <h3 class="text-2xl font-bold text-emerald-400 mb-6">Key Advantages</h3>
+                        <ul class="space-y-4 text-gray-300">
+                            <li class="flex items-start space-x-3">
+                                <span class="text-emerald-400 font-bold">✓</span>
+                                <div>
+                                    <strong>Better Specialization:</strong> Experts collaborate instead of compete, allowing focus on complementary aspects
+                                </div>
+                            </li>
+                            <li class="flex items-start space-x-3">
+                                <span class="text-emerald-400 font-bold">✓</span>
+                                <div>
+                                    <strong>Contextual Routing:</strong> Router decisions are informed by what all experts "think" about the input
+                                </div>
+                            </li>
+                            <li class="flex items-start space-x-3">
+                                <span class="text-emerald-400 font-bold">✓</span>
+                                <div>
+                                    <strong>Training Stability:</strong> Advanced auxiliary loss with diversity and balance components
+                                </div>
+                            </li>
+                            <li class="flex items-start space-x-3">
+                                <span class="text-emerald-400 font-bold">✓</span>
+                                <div>
+                                    <strong>Flexible Architecture:</strong> Temperature scaling and configurable expert/top-k parameters
+                                </div>
+                            </li>
+                        </ul>
+                    </div>
+                    
+                    <div class="bg-gray-900 rounded-xl p-8 border border-red-500/30">
+                        <h3 class="text-2xl font-bold text-red-400 mb-6">Limitations & Trade-offs</h3>
+                        <ul class="space-y-4 text-gray-300">
+                            <li class="flex items-start space-x-3">
+                                <span class="text-red-400 font-bold">⚠</span>
+                                <div>
+                                    <strong>Higher Compute Cost:</strong> Processing all experts during forward pass increases training time
+                                </div>
+                            </li>
+                            <li class="flex items-start space-x-3">
+                                <span class="text-red-400 font-bold">⚠</span>
+                                <div>
+                                    <strong>Architecture Complexity:</strong> More hyperparameters and components to tune and optimize
+                                </div>
+                            </li>
+                            <li class="flex items-start space-x-3">
+                                <span class="text-red-400 font-bold">⚠</span>
+                                <div>
+                                    <strong>Memory Requirements:</strong> Storing attention weights and intermediate activations for all experts
+                                </div>
+                            </li>
+                            <li class="flex items-start space-x-3">
+                                <span class="text-red-400 font-bold">⚠</span>
+                                <div>
+                                    <strong>Experimental Status:</strong> Novel architecture requiring validation on diverse tasks and scales
+                                </div>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+                
+                <!-- Configuration Recommendations -->
+                <div class="bg-gray-900 rounded-xl p-8 border border-blue-500/30">
+                    <h3 class="text-2xl font-bold text-blue-400 mb-6">Recommended Configuration</h3>
+                    <div class="grid md:grid-cols-3 gap-6">
+                        <div>
+                            <h4 class="text-lg font-semibold text-blue-400 mb-3">Expert Configuration</h4>
+                            <ul class="space-y-2 text-gray-300 text-sm">
+                                <li><strong>n_experts:</strong> 8-16 (balance capacity/efficiency)</li>
+                                <li><strong>top_k:</strong> 2-4 (enable collaboration without excessive overhead)</li>
+                                <li><strong>aux_loss_weight:</strong> 1e-2 to 1e-3 (sufficient regularization)</li>
+                            </ul>
+                        </div>
+                        <div>
+                            <h4 class="text-lg font-semibold text-blue-400 mb-3">Router Settings</h4>
+                            <ul class="space-y-2 text-gray-300 text-sm">
+                                <li><strong>router_temperature:</strong> 0.5-2.0 (1.0 = neutral)</li>
+                                <li><strong>&lt; 1.0:</strong> Sharper selection</li>
+                                <li><strong>&gt; 1.0:</strong> Smoother distribution</li>
+                            </ul>
+                        </div>
+                        <div>
+                            <h4 class="text-lg font-semibold text-blue-400 mb-3">Use Cases</h4>
+                            <ul class="space-y-2 text-gray-300 text-sm">
+                                <li><strong>Ideal:</strong> Diverse reasoning tasks</li>
+                                <li><strong>Ideal:</strong> Large models needing efficiency</li>
+                                <li><strong>Avoid:</strong> Very small models</li>
+                                <li><strong>Avoid:</strong> Homogeneous tasks</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Code Access Section -->
+    <section id="code" class="py-20 bg-gray-900">
+        <div class="container mx-auto px-6 text-center">
+            <div class="max-w-4xl mx-auto">
+                <h2 class="text-4xl font-bold mb-6 text-blue-400">Access the Code</h2>
+                <p class="text-xl text-gray-400 mb-12">
+                    Complete implementation of the LunarisCodex-MoC architecture with collaborative experts
+                </p>
+                
+                <div class="bg-gray-800 rounded-xl p-8 border border-gray-700 mb-8">
+                    <div class="flex items-center justify-center mb-6">
+                        <svg class="w-16 h-16 text-blue-400" fill="currentColor" viewBox="0 0 20 20">
+                            <path fill-rule="evenodd" d="M12.316 3.051a1 1 0 01.633 1.265l-4 12a1 1 0 11-1.898-.632l4-12a1 1 0 011.265-.633zM5.707 6.293a1 1 0 010 1.414L3.414 10l2.293 2.293a1 1 0 11-1.414 1.414l-3-3a1 1 0 010-1.414l3-3a1 1 0 011.414 0zm8.586 0a1 1 0 011.414 0l3 3a1 1 0 010 1.414l-3 3a1 1 0 11-1.414-1.414L16.586 10l-2.293-2.293a1 1 0 010-1.414z" clip-rule="evenodd"/>
+                        </svg>
+                    </div>
+                    <h3 class="text-2xl font-bold text-blue-400 mb-4">Full Source Code Available</h3>
+                    <p class="text-lg text-gray-300 mb-6">
+                        The complete LunarisCodex-MoC implementation includes the CollaborativeExpertsModule, 
+                        advanced auxiliary loss, and training infrastructure.
+                    </p>
+                    <div class="space-y-4">
+                        <div class="text-gray-400">
+                            <strong>Included:</strong> model_moe.py • train_moe.py • Configuration examples • Documentation
+                        </div>
+                        
+                        <!-- GitHub button placeholder -->
+                        <div class="bg-gray-700/50 border-2 border-dashed border-gray-600 rounded-lg p-6">
+                            <p class="text-gray-400 mb-4">
+                                📂 The source code for <code class="bg-gray-800 px-2 py-1 rounded text-blue-400">LunarisCodex-MoC</code> will be made publicly available soon.
+                            </p>
+                            <p class="text-sm text-gray-500">
+                                Stay tuned for the full GitHub repository with examples, benchmarks, and detailed documentation.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Key Implementation Highlights -->
+                <div class="grid md:grid-cols-3 gap-6 text-left">
+                    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                        <h4 class="text-lg font-semibold text-purple-400 mb-3">🏗️ Architecture</h4>
+                        <ul class="text-sm text-gray-300 space-y-2">
+                            <li>• CollaborativeExpertsModule</li>
+                            <li>• Router with self-attention</li>
+                            <li>• Cross-attention fusion</li>
+                            <li>• Advanced auxiliary loss</li>
+                        </ul>
+                    </div>
+                    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                        <h4 class="text-lg font-semibold text-emerald-400 mb-3">⚙️ Training</h4>
+                        <ul class="text-sm text-gray-300 space-y-2">
+                            <li>• YAML configuration system</li>
+                            <li>• Weights & Biases integration</li>
+                            <li>• Gradient accumulation</li>
+                            <li>• Checkpointing support</li>
+                        </ul>
+                    </div>
+                    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                        <h4 class="text-lg font-semibold text-blue-400 mb-3">🔧 Features</h4>
+                        <ul class="text-sm text-gray-300 space-y-2">
+                            <li>• Temperature-scaled routing</li>
+                            <li>• Configurable expert count</li>
+                            <li>• Flexible top-k selection</li>
+                            <li>• Generation capabilities</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="bg-gray-800 border-t border-gray-700 py-12">
+        <div class="container mx-auto px-6 text-center">
+            <div class="mb-8">
+                <h3 class="text-2xl font-bold text-blue-400 mb-2">LunarisCodex-MoC</h3>
+                <p class="text-gray-400">Evolving Mixture of Experts through Collaboration</p>
+            </div>
+            
+            <div class="border-t border-gray-700 pt-8">
+                <p class="text-gray-400 mb-4">
+                    A project by <strong class="text-blue-400">Francisco</strong>
+                </p>
+                <div class="flex justify-center space-x-6">
+                    <a href="https://linkedin.com/in/francisco" class="text-gray-400 hover:text-blue-400 transition-colors" target="_blank" rel="noopener">
+                        <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 20 20">
+                            <path fill-rule="evenodd" d="M16.338 16.338H13.67V12.16c0-.995-.017-2.277-1.387-2.277-1.39 0-1.601 1.086-1.601 2.207v4.248H8.014v-8.59h2.559v1.174h.037c.356-.675 1.227-1.387 2.526-1.387 2.703 0 3.203 1.778 3.203 4.092v4.711zM5.005 6.575a1.548 1.548 0 11-.003-3.096 1.548 1.548 0 01.003 3.096zm-1.337 9.763H6.34v-8.59H3.667v8.59zM17.668 1H2.328C1.595 1 1 1.581 1 2.298v15.403C1 18.418 1.595 19 2.328 19h15.34c.734 0 1.332-.582 1.332-1.299V2.298C19 1.581 18.402 1 17.668 1z" clip-rule="evenodd"/>
+                        </svg>
+                    </a>
+                </div>
+            </div>
+            
+            <div class="mt-8 text-sm text-gray-500">
+                <p>&copy; 2025 Francisco. This research project showcases novel AI architecture concepts.</p>
+            </div>
+        </div>
+    </footer>
+
+    <!-- JavaScript for smooth scrolling and mobile menu -->
+    <script>
+        // Smooth scrolling for navigation links
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'start'
+                    });
+                }
+                // Close mobile menu if open
+                document.getElementById('mobile-menu').classList.add('hidden');
+            });
+        });
+
+        // Mobile menu toggle
+        document.getElementById('mobile-menu-btn').addEventListener('click', function() {
+            document.getElementById('mobile-menu').classList.toggle('hidden');
+        });
+
+        // Close mobile menu when clicking on links
+        document.querySelectorAll('.mobile-menu-link').forEach(link => {
+            link.addEventListener('click', function() {
+                document.getElementById('mobile-menu').classList.add('hidden');
+            });
+        });
+
+        // Simple fade-in animation on scroll
+        const observerOptions = {
+            threshold: 0.1,
+            rootMargin: '0px 0px -50px 0px'
+        };
+
+        const observer = new IntersectionObserver(function(entries) {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.style.animationDelay = '0s';
+                    entry.target.classList.add('fade-in-up');
+                }
+            });
+        }, observerOptions);
+
+        // Observe elements for animation
+        document.querySelectorAll('.fade-in-up').forEach(el => {
+            observer.observe(el);
+        });
+    </script>
+</body>
+</html>
