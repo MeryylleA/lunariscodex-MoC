@@ -1,91 +1,349 @@
-# LunarisCodex-MoC
+# Mixture of Collaborative Experts (MoC)
 
-*Um Modelo de Linguagem Experimental com um Módulo de Experts Colaborativos.*
+Uma arquitetura avançada de Mixture of Experts com colaboração entre especialistas
 
 ---
 
-## Visão Geral (Overview)
+## 📋 Visão Geral
 
-`LunarisCodex-MoC` é um modelo de linguagem grande (LLM) funcional, no estilo Llama, que serve como uma base de testes para arquiteturas de redes neurais de ponta. O projeto substitui a camada Feed-Forward Network (FFN) padrão dos blocos Transformer por uma implementação inovadora de **Mixture of Collaborative Experts (MoC)**. Esta arquitetura visa superar as limitações dos modelos Mixture-of-Experts (MoE) tradicionais, permitindo que os experts interajam e refinem suas saídas coletivamente antes da fusão final.
+A Mixture of Collaborative Experts (MoC) é uma evolução do tradicional Mixture of Experts (MoE) que introduz colaboração inteligente entre os especialistas selecionados. Ao invés de simplesmente combinar as saídas dos experts de forma independente, a MoC permite que os experts colaborem através de cross-attention antes da fusão final.
 
-## A Evolução: Do MoE ao MoC
+### Diferenças Fundamentais do MoE Tradicional
 
-O projeto começou como uma exploração dos modelos MoE padrão, que utilizam um roteador para enviar cada token para um único expert (`k=1`), seguindo a lógica do Switch Transformer. Embora eficientes, os MoEs tradicionais têm uma limitação fundamental: **os experts trabalham em completo isolamento**. A saída final é simplesmente o resultado do expert escolhido, sem qualquer sinergia ou refinamento entre eles.
+| Aspecto | MoE Tradicional | MoC (Nossa Implementação) |
+|---------|----------------|---------------------------|
+| Seleção de Experts | Router simples com softmax | Router contextualizado com self-attention |
+| Colaboração | Nenhuma - experts independentes | Cross-attention entre experts selecionados |
+| Auxiliary Loss | Load balancing básico | Diversity + Balance combinados |
+| Estabilidade | Problemas de renormalização | Softmax direto nos logits |
 
-A questão que impulsionou este projeto foi: "E se os experts pudessem colaborar?". O MoC (Mixture of Collaborative Experts) é a resposta a essa pergunta. A arquitetura foi descoberta durante uma série de experimentos com IAs de ponta, onde uma implementação de referência gerada por um modelo misterioso e altamente avançado (apelidado de "ryo / GPT-5-Alpha") demonstrou uma abordagem fundamentalmente nova. O MoC move-se para além do simples roteamento, introduzindo mecanismos para que os experts interajam de forma significativa, tornando a camada de FFN um processo dinâmico e colaborativo.
+---
 
-## Inovações Arquiteturais do MoC
+## 🏗️ Arquitetura Detalhada
 
-O `CollaborativeExpertsModule` é o coração do `LunarisCodex-MoC`. Ele introduz duas inovações principais que o distinguem dos MoEs convencionais.
+### Componentes Principais
 
-### 1. Router Contextualization (Roteamento Contextualizado)
+#### 1. Router Contextualization
 
-> **O Problema:** Roteadores MoE padrão tomam decisões com base apenas na representação do token de entrada, sem qualquer conhecimento do que os diferentes experts "pensam" sobre esse token. A decisão é cega.
->
-> **A Solução MoC:** O roteador do MoC é muito mais sofisticado. O fluxo de decisão é o seguinte:
-> 1.  O token de entrada é enviado para **todos os experts** em paralelo, e a saída de cada um é calculada.
-> 2.  Uma camada de **auto-atenção (self-attention)** é aplicada sobre esses *outputs* dos experts. Isso permite que o roteador entenda as relações e os acordos/desacordos entre as "opiniões" dos experts.
-> 3.  Com base nesse resumo contextual rico, o roteador toma uma decisão de roteamento top-k muito mais informada, selecionando os experts mais relevantes com base em uma compreensão holística.
+```python
+# Self-attention sobre TODOS os expert outputs
+contextualized_experts, _ = self.router_self_attn(
+    expert_flat, expert_flat, expert_flat
+)
+```
 
-### 2. Collaborative Fusion (Fusão Colaborativa)
+**Por que isso é importante:**
+- O router não decide baseado apenas no input token
+- Considera as saídas de todos os experts para fazer uma seleção mais informada
+- Permite routing adaptativo baseado no contexto completo
 
-> **O Problema:** Em MoEs padrão que usam `k > 1`, as saídas dos experts selecionados são simplesmente combinadas através de uma soma ponderada. Não há colaboração real.
->
-> **A Solução MoC:** Uma vez que os `k` experts são selecionados, a colaboração começa:
-> 1.  As saídas dos `k` experts escolhidos são empilhadas.
-> 2.  Essas saídas são alimentadas em uma camada de **atenção cruzada (cross-attention)**, onde cada expert selecionado "atende" aos outputs dos outros experts selecionados.
-> 3.  Isso permite que cada expert refine sua própria saída com base nas perspectivas de seus pares.
-> 4.  Apenas após esse processo de refinamento colaborativo, as saídas são combinadas de forma ponderada para produzir o resultado final.
+#### 2. Top-K Selection com Temperature
 
-## A Perda Auxiliar Avançada
+```python
+# Temperature scaling para controle de distribuição
+routing_logits = routing_logits / self.router_temperature
 
-Para garantir que o sistema MoC treine de forma estável e que a colaboração seja eficaz, uma perda auxiliar multifacetada é crucial. Ela é composta por dois elementos:
+# Seleção estável dos top-k experts
+topk_logits, topk_indices = torch.topk(routing_logits, self.top_k, dim=-1)
+topk_probs = F.softmax(topk_logits, dim=-1)
+```
 
-1.  **Perda de Balanceamento (Balance Loss):** Semelhante aos MoEs padrão, esta perda incentiva o roteador a distribuir os tokens de forma relativamente uniforme entre todos os experts, evitando o colapso onde apenas alguns experts são utilizados. Ela é calculada sobre a variância do uso dos experts.
+**Vantagens:**
+- Numericamente mais estável que renormalização manual
+- Temperature permite controlar sharpness da distribuição
+- Evita problemas de divisão por zero
 
-2.  **Perda de Diversidade (Diversity Loss):** Esta é a inovação principal da perda auxiliar do MoC. Ela é calculada sobre a **entropia dos pesos da atenção cruzada** durante a etapa de fusão colaborativa. Ao maximizar essa entropia, a perda incentiva a criação de padrões de colaboração ricos e diversificados, impedindo que os experts "viciem" em atender sempre aos mesmos pares da mesma maneira.
+#### 3. Collaborative Fusion
 
-## Como Treinar
+```python
+# Cross-attention entre experts selecionados
+collaborative_outputs, collab_attn = self.collab_cross_attn(
+    selected_flat, selected_flat, selected_flat
+)
 
-O treinamento do `LunarisCodex-MoC` é gerenciado através do script `train_moe.py` e um arquivo de configuração YAML.
+# Refinement adicional
+refined_outputs = self.collab_ffn(collaborative_outputs) + collaborative_outputs
+```
 
-1.  **Crie um arquivo de configuração**, por exemplo `config_moc.yaml`. Destaque os parâmetros específicos do MoC:
+**O diferencial:**
+- Experts selecionados "conversam" entre si via cross-attention
+- Refinement FFN adicional para melhorar a colaboração
+- Residual connections para estabilidade de treino
 
-    ```yaml
-    # config_moc.yaml
-    model:
-      d_model: 768
-      n_layers: 12
-      n_heads: 12
-      n_kv_heads: 12
-      vocab_size: 50257
-      max_seq_len: 1024
-      # --- Parâmetros do MoC ---
-      n_experts: 8          # Número total de experts a serem criados
-      top_k: 2              # Número de experts a serem selecionados para colaboração
-      aux_loss_weight: 0.01 # Peso da perda auxiliar (balanceamento + diversidade)
+#### 4. Advanced Auxiliary Loss
 
-    data_dir: "data/"
-    out_dir: "checkpoints/lunaris-moc-8e-2k"
-    learning_rate: 3.0e-4
-    max_steps: 600000
-    batch_size: 16
-    gradient_accumulation_steps: 4
-    wandb_project: "lunaris-codex-moc"
-    wandb_run_name: "moc-8-experts-2-topk"
-    ```
+```python
+def compute_diversity_loss(self, cross_attn_weights, routing_probs):
+    # Diversity: maximizar entropia da cross-attention
+    attn_entropy = -torch.sum(
+        cross_attn_weights * torch.log(cross_attn_weights + 1e-8), dim=-1
+    ).mean()
+    diversity_loss = -attn_entropy
+    
+    # Balance: minimizar variância do uso dos experts
+    expert_usage = routing_probs.mean(dim=[0, 1])
+    balance_loss = torch.var(expert_usage)
+    
+    return 0.01 * diversity_loss + 0.01 * balance_loss
+```
 
-2.  **Inicie o treinamento** usando o seguinte comando:
+---
 
-    ```bash
-    python train_moe.py config_moc.yaml
-    ```
+## 🔄 Fluxo de Processamento
 
-3.  **Monitore no Weights & Biases:** Durante o treinamento, preste atenção especial às seguintes métricas:
-    *   `loss/main`: A perda de cross-entropy padrão. Ela mede o quão bem o modelo está prevendo o próximo token.
-    *   `loss/aux`: A perda auxiliar do MoC. Um valor estável aqui indica que o roteador está balanceando a carga e que a colaboração entre os experts é diversificada.
-    *   `perplexity`: Calculada apenas a partir de `loss/main`, é a principal métrica de desempenho do modelo de linguagem.
+### Step-by-Step
 
-## Jornada do Projeto e Agradecimentos
+1. **Input Processing**
+   - Recebe tokens: (batch_size, seq_len, d_model)
+   - Processa através de TODOS os experts em paralelo
 
-Este projeto representa uma jornada de descoberta. A busca por arquiteturas MoE mais eficazes começou com experimentos na LLM Arena, comparando as saídas de vários modelos de ponta. A inspiração para a arquitetura MoC não foi teórica, mas sim empírica, derivada da análise de uma implementação de referência gerada por um modelo de IA de próxima geração, "GPT-5".
+2. **Router Contextualization**
+   - Self-attention sobre todas as saídas dos experts
+   - Gera representação contextualizada para routing
+
+3. **Expert Selection**
+   - Aplica temperature scaling nos routing logits
+   - Seleciona top-k experts via torch.topk()
+   - Calcula probabilidades com softmax estável
+
+4. **Collaborative Fusion**
+   - Cross-attention entre experts selecionados
+   - Refinement via FFN adicional
+   - Residual connections para estabilidade
+
+5. **Final Output**
+   - Combinação ponderada das saídas colaborativas
+   - Projeção final + auxiliary loss
+
+### Dimensões dos Tensors
+
+```
+Input: (B, S, d_model)
+Expert Outputs: (B, S, n_experts, d_model)
+Contextualized: (B*S, n_experts, d_model)
+Top-K Selection: (B, S, top_k, d_model)
+Final Output: (B, S, d_model)
+```
+
+---
+
+## ⚙️ Configuração
+
+### Parâmetros Principais
+
+```python
+@dataclass
+class LunarisCodexConfig:
+    # MoC Specific Parameters
+    n_experts: int = 8                    # Número total de experts
+    top_k: int = 2                        # Quantos experts selecionar
+    aux_loss_weight: float = 1e-2         # Peso da auxiliary loss
+    router_temperature: float = 1.0       # Temperature para routing
+```
+
+### Recomendações de Configuração
+
+| Parâmetro | Valor Recomendado | Justificativa |
+|-----------|------------------|---------------|
+| n_experts | 8-16 | Balance entre capacidade e eficiência |
+| top_k | 2-4 | Permite colaboração sem overhead excessivo |
+| aux_loss_weight | 1e-2 a 1e-3 | Suficiente para regularização |
+| router_temperature | 0.5-2.0 | 1.0 = neutro, <1.0 = mais sharp, >1.0 = mais suave |
+
+---
+
+## 🧮 Análise Matemática
+
+### Complexidade Computacional
+
+**Forward Pass:**
+- Expert computation: O(B × S × n_experts × d_model²)
+- Router self-attention: O(B × S × n_experts² × d_model)
+- Cross-attention: O(B × S × top_k² × d_model)
+- **Total: O(B × S × n_experts × d_model²) (dominante)**
+
+**Comparação com MoE tradicional:**
+- MoE: O(B × S × top_k × d_model²)
+- MoC: O(B × S × n_experts × d_model²) (durante treino)
+- **Trade-off: Maior custo computacional por melhor qualidade**
+
+### Auxiliary Loss Breakdown
+
+**Diversity Loss: Encoraja padrões diversos na cross-attention**
+- Previne collapse dos experts
+- Maximiza entropia das attention weights
+
+**Balance Loss: Garante uso equilibrado dos experts**
+- Minimiza variância do expert usage
+- Evita que alguns experts sejam ignorados
+
+---
+
+## 🚀 Vantagens da MoC
+
+### 1. Melhor Especialização
+- Experts colaboram ao invés de competir
+- Cada expert pode focar em aspectos específicos
+- Combinação inteligente de conhecimentos
+
+### 2. Routing Contextualizado
+- Decisões de routing mais informadas
+- Considera output de todos os experts
+- Adaptativo ao contexto atual
+
+### 3. Estabilidade de Treino
+- Auxiliary loss bem balanceada
+- Softmax numericamente estável
+- Residual connections para gradientes
+
+### 4. Flexibilidade
+- Temperature permite tuning fino
+- Configurável para diferentes tarefas
+- Escalável para mais experts
+
+---
+
+## 🔧 Implementação
+
+### Integração no Transformer
+
+```python
+class Block(nn.Module):
+    def __init__(self, config):
+        # ... attention layers ...
+        
+        if config.n_experts is not None and config.n_experts > 0:
+            self.feed_forward = CollaborativeExpertsModule(config)
+            self.is_moe = True
+        else:
+            self.feed_forward = FeedForward(config)
+            self.is_moe = False
+```
+
+### Training Loop Considerations
+
+```python
+# Durante o forward pass
+logits, loss, past_key_values = model(idx, targets=targets)
+
+if loss is not None:
+    total_loss, main_loss, aux_loss = loss
+    # total_loss já inclui auxiliary loss ponderada
+    total_loss.backward()
+```
+
+---
+
+## 📊 Monitoramento e Debug
+
+### Métricas Importantes
+
+**Expert Usage Distribution**
+```python
+expert_usage = routing_probs.mean(dim=[0, 1])
+print(f"Expert usage variance: {torch.var(expert_usage):.4f}")
+```
+
+**Auxiliary Loss Components**
+```python
+print(f"Diversity loss: {diversity_loss:.4f}")
+print(f"Balance loss: {balance_loss:.4f}")
+```
+
+**Routing Entropy**
+```python
+routing_entropy = -torch.sum(routing_probs * torch.log(routing_probs + 1e-8), dim=-1).mean()
+print(f"Routing entropy: {routing_entropy:.4f}")
+```
+
+---
+
+## 🎯 Casos de Uso
+
+### Quando Usar MoC
+
+✅ **Ideal para:**
+- Tarefas que requerem diferentes tipos de raciocínio
+- Modelos grandes onde eficiência é importante
+- Cenários com dados diversificados
+- Quando você quer melhor interpretabilidade
+
+❌ **Evitar quando:**
+- Modelos muito pequenos (overhead não compensa)
+- Tarefas muito específicas/homogêneas
+- Recursos computacionais muito limitados
+- Prototipagem rápida (use FFN padrão primeiro)
+
+---
+
+## 🔬 Experimentos e Tuning
+
+### Hyperparameter Sweep Sugerido
+
+```python
+# Configurações para testar
+configs = [
+    {"n_experts": 8, "top_k": 2, "router_temperature": 1.0},
+    {"n_experts": 8, "top_k": 3, "router_temperature": 0.7},
+    {"n_experts": 16, "top_k": 4, "router_temperature": 1.2},
+]
+```
+
+### Ablation Studies
+- **Sem Router Contextualization:** Remove self-attention do router
+- **Sem Collaborative Fusion:** Remove cross-attention entre experts
+- **Auxiliary Loss Components:** Teste diversity vs balance separadamente
+
+---
+
+## 📚 Referências e Inspirações
+
+### Papers Relacionados
+- **Switch Transformer:** Fundação do MoE moderno
+- **GLaM:** Scaling MoE para modelos gigantes
+- **Expert Choice:** Routing improvements
+
+### Diferenças da Nossa Implementação
+- Router contextualization com self-attention
+- Collaborative fusion via cross-attention
+- Auxiliary loss combinada (diversity + balance)
+- Integração limpa com arquitetura Llama-style
+
+---
+
+## 🐛 Troubleshooting
+
+### Problemas Comuns
+
+**Auxiliary Loss Muito Alta**
+- Reduza aux_loss_weight
+- Verifique se diversity e balance estão balanceados
+
+**Experts Não Sendo Usados**
+- Aumente router_temperature
+- Verifique inicialização dos pesos
+
+**Instabilidade de Treino**
+- Reduza learning rate
+- Verifique gradient clipping
+
+**Overfitting**
+- Aumente dropout
+- Reduza número de experts ou top_k
+
+---
+
+## 💡 Ideias para Extensões Futuras
+
+- **Dynamic Top-K:** Ajustar top_k baseado no contexto
+- **Hierarchical Experts:** Experts especializados em diferentes níveis
+- **Memory-Augmented Routing:** Router com memória de decisões passadas
+- **Multi-Scale Collaboration:** Cross-attention em diferentes escalas
+
+---
+
+**Criado por:** Francisco  
+**Data:** Julho 2025  
+**Versão:** 1.0
+
+> "A ideia é simples: ao invés de experts competindo, eles colaboram. E essa colaboração acontece através de cross-attention, permitindo que cada expert refine sua saída baseado no que os outros experts estão 'pensando'."
