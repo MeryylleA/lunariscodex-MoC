@@ -1,141 +1,244 @@
-# LunarisCodex-MoC
-
-*Um Modelo de Linguagem Experimental com um Módulo de Experts Colaborativos.*
+# LunarisCodex-MoC  
+*An Experimental Language Model featuring a Collaborative Experts Module.*
 
 ---
 
-## Visão Geral (Overview)
+## Overview
 
-`LunarisCodex-MoC` é um modelo de linguagem grande (LLM) funcional, no estilo Llama, que serve como uma base de testes para arquiteturas de redes neurais de ponta. O projeto substitui a camada Feed-Forward Network (FFN) padrão dos blocos Transformer por uma implementação inovadora de **Mixture of Collaborative Experts (MoC)**. Esta arquitetura visa superar as limitações dos modelos Mixture-of-Experts (MoE) tradicionais, permitindo que os experts interajam e refinem suas saídas coletivamente antes da fusão final.
+`LunarisCodex-MoC` is a fully-functional, Llama-style large language model that serves as a test-bed for cutting-edge neural architectures.  
+It replaces the standard Feed-Forward Network (FFN) in each Transformer block with a novel **Mixture of Collaborative Experts (MoC)** module.  
+Where traditional Mixture-of-Experts (MoE) models route tokens to *isolated* experts, MoC enables the *selected* experts to **interact and refine their outputs together** before the final fusion—unlocking richer representations and potentially better specialization.
 
-## Entendendo o Conceito: A Analogia dos Ministros
+---
 
-Para compreender melhor a diferença entre MoE tradicional e o novo MoC, imagine um governo lidando com um problema complexo:
+## The Core Concept: An Analogy (Entendendo o Conceito)
 
-### O Método Antigo: MoE Padrão (O Presidente Sobrecarregado)
+### The Old Way: Standard MoE (The Overloaded President)
 
-Imagine um presidente que precisa lidar com um relatório sobre "Economia vs. Meio Ambiente":
+Imagine a president facing a complex report on “Economy vs. Environment”.
 
-1. **Decisão Rápida**: O presidente olha apenas o título e pensa: "80% Economia, 20% Meio Ambiente"
-2. **Seleção Simples**: Chama apenas a Ministra da Economia e o Ministro do Meio Ambiente
-3. **Trabalho Isolado**: Cada ministro vai para sua sala e trabalha sozinho, sem conversar
-4. **Combinação Mecânica**: O presidente pega 80% das ideias da Economia e 20% do Meio Ambiente
-5. **O Problema**: A solução final é incoerente - as políticas econômicas podem contradizer diretamente as ambientais
+1. **Quick Decision**: The president glances at the title and thinks: *“80 % Economy, 20 % Environment.”*  
+2. **Simple Selection**: Calls **only** the Minister of Economy and the Minister of Environment.  
+3. **Isolated Work**: Each minister works **alone**, never exchanging ideas.  
+4. **Mechanical Merge**: The president takes 80 % of the economic plan and 20 % of the environmental plan.  
+5. **Result**: The final policy is **incoherent**—economic incentives may directly contradict environmental goals.
 
-### O Novo Método: MoC (O Presidente Sábio)
+### The New Way: MoC (The Wise President)
 
-O mesmo problema, mas com uma abordagem muito mais sofisticada:
+Same problem, but handled with **collaboration**:
 
-#### Fase 1: Roteamento Contextualizado (A Reunião Preliminar)
-1. **Pré-Análise**: O presidente envia o relatório para TODOS os 8 ministros e pede um resumo inicial
-2. **Reunião de Contexto**: Todos se reúnem em uma sala:
-   - A Ministra da Economia ouve o Ministro de Relações Exteriores falar sobre acordos internacionais
-   - O Ministro do Meio Ambiente ouve sobre campanhas educacionais
-   - Eles não estão resolvendo ainda, apenas entendendo as conexões
-3. **Decisão Informada**: Com essa visão holística, o presidente percebe que precisa também do Ministro de Relações Exteriores (acordos climáticos) - escolhe 3 ministros em vez de 2
+#### Phase 1 – Contextualized Routing (The Preliminary Meeting)
+1. **Pre-Analysis**: The report is sent **to all 8 ministers** for an initial summary.  
+2. **Context Meeting**: Everyone gathers.  
+   - The Minister of Economy hears the Foreign Affairs minister discuss climate treaties.  
+   - The Environment minister hears the Education minister mention green-campaigns.  
+3. **Informed Choice**: With this holistic view, the president realizes he also needs the Foreign Affairs minister—selects **3** ministers instead of 2.
 
-#### Fase 2: Fusão Colaborativa (A Força-Tarefa)
-1. **Reunião de Trabalho**: Os 3 ministros escolhidos vão para uma sala de reuniões
-2. **Discussão e Refinamento**:
-   - Economia: "Proponho incentivos fiscais para empresas verdes"
-   - Relações Exteriores: "Ótimo, mas o Acordo de Paris exige metas mais rígidas"
-   - Meio Ambiente: "E se usarmos esses incentivos para subsidiar pesquisa em captura de carbono?"
-3. **Relatório Integrado**: Em vez de 3 relatórios separados, produzem uma solução coesa onde cada aspecto considera os outros
+#### Phase 2 – Collaborative Fusion (The Task-Force)
+1. **Working Session**: The 3 chosen ministers enter a war-room.  
+2. **Cross-Pollination**:  
+   - Economy: *“Let’s offer tax credits for green companies.”*  
+   - Foreign Affairs: *“Great, but the Paris Agreement requires stricter targets.”*  
+   - Environment: *“What if those credits fund carbon-capture research?”*  
+3. **Integrated Report**: Instead of 3 separate proposals, they deliver **one cohesive policy** that is economically sound, environmentally responsible, and internationally aligned.
 
-**Resultado**: Uma política que é economicamente viável, ambientalmente responsável e internacionalmente alinhada.
+---
 
-## A Evolução: Do MoE ao MoC
+## Architectural Innovations: From MoE to MoC
 
-O projeto começou como uma exploração dos modelos MoE padrão, que utilizam um roteador para enviar cada token para um único expert (`k=1`), seguindo a lógica do Switch Transformer. Embora eficientes, os MoEs tradicionais têm uma limitação fundamental: **os experts trabalham em completo isolamento**. A saída final é simplesmente o resultado do expert escolhido, sem qualquer sinergia ou refinamento entre eles.
+### Historical Context
+The project began with the standard Switch-Transformer-style MoE (top-1 routing). While efficient, these models suffer from a **fundamental limitation**:  
+> **Experts work in complete isolation.**  
+The final output is simply the chosen expert’s result, with zero synergy or refinement.
 
-A questão que impulsionou este projeto foi: "E se os experts pudessem colaborar?". O MoC (Mixture of Collaborative Experts) é a resposta a essa pergunta.
+MoC answers the question:  
+> “*What if experts could collaborate?*”
 
-## Inovações Arquiteturais do MoC
+### 1. Router Contextualization
+| Traditional MoE | MoC (Router Contextualization) |
+|-----------------|-------------------------------|
+| Router decides **blindly** from the input token alone. | Router **first sees** what *every* expert “thinks” about the token. |
 
-O `CollaborativeExpertsModule` é o coração do `LunarisCodex-MoC`. Ele introduz duas inovações principais que o distinguem dos MoEs convencionais.
+#### How it Works
+```python
+# 1. Forward through ALL experts in parallel
+expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)
 
-### 1. Router Contextualization (Roteamento Contextualizado)
+# 2. Self-attention over all expert outputs
+contextualized, _ = self.router_self_attn(
+    expert_flat, expert_flat, expert_flat
+)
 
-> **O Problema:** Roteadores MoE padrão tomam decisões com base apenas na representação do token de entrada, sem qualquer conhecimento do que os diferentes experts "pensam" sobre esse token. A decisão é cega.
->
-> **A Solução MoC:** O roteador do MoC é muito mais sofisticado. O fluxo de decisão é o seguinte:
-> 1. O token de entrada é enviado para **todos os experts** em paralelo (como enviar o relatório para todos os ministros)
-> 2. Uma camada de **auto-atenção (self-attention)** é aplicada sobre esses outputs dos experts (a "reunião preliminar" onde todos escutam uns aos outros)
-> 3. Com base nesse resumo contextual rico, o roteador toma uma decisão de roteamento top-k muito mais informada (o presidente escolhe a equipe certa com base na discussão completa)
+# 3. Route with contextualized information
+routing_logits = self.router_gate(contextualized.mean(1))
+```
 
-### 2. Collaborative Fusion (Fusão Colaborativa)
+#### Why it Matters
+- **Context-aware routing** – decisions consider the entire expert landscape.  
+- **Adaptive selection** – routing can change based on dynamic context.  
+- **Avoids blind spots** – less chance of missing the *best* expert.
 
-> **O Problema:** Em MoEs padrão que usam `k > 1`, as saídas dos experts selecionados são simplesmente combinadas através de uma soma ponderada. Não há colaboração real.
->
-> **A Solução MoC:** Uma vez que os `k` experts são selecionados, a colaboração começa:
-> 1. As saídas dos `k` experts escolhidos são empilhadas (os ministros escolhidos vão para a sala de reuniões)
-> 2. Essas saídas são alimentadas em uma camada de **atenção cruzada (cross-attention)** (cada ministro escuta e responde aos outros)
-> 3. Isso permite que cada expert refine sua própria saída com base nas perspectivas de seus pares (refinamento colaborativo das propostas)
-> 4. Apenas após esse processo de refinamento colaborativo, as saídas são combinadas de forma ponderada para produzir o resultado final (relatório integrado)
+### 2. Collaborative Fusion
+| Traditional MoE (k>1) | MoC (Collaborative Fusion) |
+|-----------------------|---------------------------|
+| Weighted sum of raw expert outputs. | Experts **talk to each other** via cross-attention, then fuse. |
 
-## A Perda Auxiliar Avançada
+#### How it Works
+```python
+# 1. Select top-k experts via contextualized routing
+selected = expert_outputs[batch_indices, seq_indices, topk_indices]
 
-Para garantir que o sistema MoC treine de forma estável e que a colaboração seja eficaz, uma perda auxiliar multifacetada é crucial. Ela é composta por dois elementos:
+# 2. Cross-attention between selected experts
+collab_out, attn_weights = self.collab_cross_attn(
+    selected_flat, selected_flat, selected_flat
+)
 
-1. **Perda de Balanceamento (Balance Loss):** Semelhante aos MoEs padrão, esta perda incentiva o roteador a distribuir os tokens de forma relativamente uniforme entre todos os experts, evitando o colapso onde apenas alguns experts são utilizados.
+# 3. Refinement via small FFN
+refined = self.collab_ffn(collab_out) + collab_out
+```
 
-2. **Perda de Diversidade (Diversity Loss):** Esta é a inovação principal da perda auxiliar do MoC. Ela é calculada sobre a **entropia dos pesos da atenção cruzada** durante a etapa de fusão colaborativa. Ao maximizar essa entropia, a perda incentiva a criação de padrões de colaboração ricos e diversificados, impedindo que os experts "viciem" em atender sempre aos mesmos pares da mesma maneira.
+#### Why it Matters
+- **Synergy** – each expert refines its output using peer knowledge.  
+- **Coherence** – final representation is *more than the sum of its parts*.  
+- **Stability** – residual connections and layer-norm keep gradients healthy.
 
-## Como Treinar
+---
 
-O treinamento do `LunarisCodex-MoC` é gerenciado através do script `train_moe.py` e um arquivo de configuração YAML.
+## The Advanced Auxiliary Loss
 
-1. **Crie um arquivo de configuração**, por exemplo `config_moc.yaml`. Destaque os parâmetros específicos do MoC:
+To keep training stable and collaboration meaningful, MoC employs a **composite auxiliary loss** scaled by `aux_loss_weight`.
 
-    ```yaml
-    # config_moc.yaml
-    model:
-      d_model: 768
-      n_layers: 12
-      n_heads: 12
-      n_kv_heads: 12
-      vocab_size: 50257
-      max_seq_len: 1024
-      # --- Parâmetros do MoC ---
-      n_experts: 8          # Número total de experts a serem criados
-      top_k: 2              # Número de experts a serem selecionados para colaboração
-      aux_loss_weight: 0.01 # Peso da perda auxiliar (balanceamento + diversidade)
+| Component | Intuition | Implementation |
+|-----------|-----------|----------------|
+| **Balance Loss** | Encourage uniform expert usage. | Minimize variance of `routing_probs.mean(dim=[0,1])`. |
+| **Diversity Loss** | Prevent collapse in cross-attention patterns. | Maximize entropy of cross-attention weights. |
 
-    data_dir: "data/"
-    out_dir: "checkpoints/lunaris-moc-8e-2k"
-    learning_rate: 3.0e-4
-    max_steps: 600000
-    batch_size: 16
-    gradient_accumulation_steps: 4
-    wandb_project: "lunaris-codex-moc"
-    wandb_run_name: "moc-8-experts-2-topk"
-    ```
+```python
+def compute_diversity_loss(attn_weights, routing_probs):
+    # Diversity: maximize entropy of cross-attention
+    attn_entropy = -torch.sum(
+        attn_weights * torch.log(attn_weights + 1e-8), dim=-1
+    ).mean()
 
-2. **Inicie o treinamento** usando o seguinte comando:
+    # Balance: minimize variance of expert usage
+    expert_usage = routing_probs.mean(dim=[0, 1])
+    balance_loss = torch.var(expert_usage)
 
-    ```bash
-    python train_moe.py config_moc.yaml
-    ```
+    return 0.01 * (-attn_entropy) + 0.01 * balance_loss
+```
 
-3. **Monitore no Weights & Biases:** Durante o treinamento, preste atenção especial às seguintes métricas:
-    - `loss/main`: A perda de cross-entropy padrão. Ela mede o quão bem o modelo está prevendo o próximo token.
-    - `loss/aux`: A perda auxiliar do MoC. Um valor estável aqui indica que o roteador está balanceando a carga e que a colaboração entre os experts é diversificada.
-    - `perplexity`: Calculada apenas a partir de `loss/main`, é a principal métrica de desempenho do modelo de linguagem.
+---
 
-## Limitações e Considerações
+## Technical Deep Dive
 
-Como um projeto experimental, o MoC tem trade-offs importantes:
+### Data Flow (Step-by-Step)
+1. **Input** `(B, S, d_model)`  
+2. **Expert Computation** – all experts run in parallel → `(B, S, n_experts, d_model)`  
+3. **Router Contextualization** – self-attention over experts → contextualized logits  
+4. **Top-K Selection** – choose `k` experts, apply temperature scaling  
+5. **Collaborative Fusion** – cross-attention + refinement → `(B, S, k, d_model)`  
+6. **Weighted Fusion** – combine with routing weights → `(B, S, d_model)`  
+7. **Final Projection** – `o_proj` back to model dimension.
 
-- **Custo Computacional**: Processar todos os experts + atenção cruzada é mais caro que MoE padrão
-- **Complexidade**: A arquitetura é mais complexa, com mais hiperparâmetros para ajustar
-- **Experimentação**: Este é um protótipo conceitual - a eficácia prática ainda precisa ser validada
+### Tensor Dimensions
+```
+Input:           (B, S, d_model)
+Expert Outputs:  (B, S, n_experts, d_model)
+Contextualized:  (B*S, n_experts, d_model)
+Top-K Selected:  (B, S, top_k, d_model)
+Final Output:    (B, S, d_model)
+```
 
-## Resumo da Arquitetura
+### Computational Complexity Analysis
 
-**Conceito Central**: O LunarisCodex-MoC transforma os experts de "consultores isolados" em uma "equipe colaborativa".
+| Phase | Complexity | Notes |
+|-------|------------|-------|
+| Expert Forward | O(B·S·n_experts·d_model²) | Dominant term |
+| Router Self-Attention | O(B·S·n_experts²·d_model) | Small vs. expert FLOPs |
+| Cross-Attention (k experts) | O(B·S·k²·d_model) | k ≪ n_experts |
 
-**Arquitetura**:
-- **Router Contextualization (Auto-Atenção)**: A "reunião preliminar" com todos os ministros, que permite ao presidente fazer uma escolha muito mais inteligente sobre quem deve formar a equipe
-- **Collaborative Fusion (Atenção Cruzada)**: A "força-tarefa" onde os membros da equipe escolhida trabalham juntos, discutem e integram suas ideias para criar uma solução final muito mais forte e coesa
+**Comparison with Traditional MoE**  
+- **MoE (train)**: O(B·S·k·d_model²)  
+- **MoC (train)**: O(B·S·n_experts·d_model²)  
+> **Trade-off**: Higher compute for richer collaboration.
 
-É por isso que essa arquitetura tem potencial. Ela imita um processo de resolução de problemas muito mais sofisticado e realista, onde a colaboração e o contexto são fundamentais para chegar a uma boa solução.
+---
+
+## Usage and Training
+
+### Configuration
+Create `config_moc.yaml`:
+
+```yaml
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  n_kv_heads: 12
+  vocab_size: 50257
+  max_seq_len: 1024
+  # --- MoC specific ---
+  n_experts: 8
+  top_k: 2
+  aux_loss_weight: 0.1
+  router_temperature: 1.0
+
+data_dir: "data/"
+out_dir: "checkpoints/lunaris-moc-8e-2k"
+learning_rate: 3.0e-4
+max_steps: 600000
+batch_size: 16
+gradient_accumulation_steps: 4
+wandb_project: "lunaris-codex-moc"
+wandb_run_name: "moc-8-experts-2-topk"
+```
+
+Recommended settings:
+
+| Parameter | Range | Guideline |
+|-----------|-------|-----------|
+| `n_experts` | 8–16 | Balance capacity vs. compute |
+| `top_k` | 2–4 | Enough collaboration, low overhead |
+| `aux_loss_weight` | 1e-3–1e-2 | Tune to keep loss ≈ main loss × 0.01 |
+| `router_temperature` | 0.5–2.0 | <1 → sharper routing, >1 → smoother |
+
+### Running the Training
+```bash
+python train_moe.py config_moc.yaml
+```
+
+### Monitoring and Debugging
+
+#### Key Metrics to Watch
+| Metric | Where to Log | Healthy Range |
+|--------|--------------|---------------|
+| **loss/main** | W&B, tqdm | Steady decrease |
+| **loss/aux** | W&B, tqdm | Stable, ≈ 1–2 % of main loss |
+| **perplexity** | W&B | Calculated from `loss/main`; should improve |
+| **Expert usage variance** | Manual | Low; aim for uniform distribution |
+
+#### Common Issues & Fixes
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| Aux loss spikes | Learning rate too high | Reduce LR or increase warmup |
+| Experts unused | Temperature too high or init issues | Lower `router_temperature`, check weight init |
+| Training instability | Gradient explosion | Tighten `grad_clip`, lower LR |
+| Overfitting | Too many experts / small data | Increase dropout, reduce `n_experts` or `top_k` |
+
+---
+
+## Project Journey & Future Work
+
+From a simple MoE prototype to a fully-fledged collaborative framework, the project’s core insight was that **experts should collaborate, not compete**.  
+The next steps include:
+
+- **Dynamic Top-K**: Adjust `k` on-the-fly based on input complexity.  
+- **Hierarchical Experts**: Nested experts operating at different granularities.  
+- **Memory-Augmented Routing**: Router with episodic memory of past decisions.  
+- **Multi-Scale Collaboration**: Cross-attention across both token and expert axes.  
+
+We invite the community to experiment, extend, and improve upon this foundation.
+
+---
+
+**Maintained by Francisco • July 2025 • v1.0**
