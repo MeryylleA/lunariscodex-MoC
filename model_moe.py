@@ -261,17 +261,22 @@ class CollaborativeExpertsModule(nn.Module):
 
         # --- MODIFICATION START ---
         # Step 3: Top-K Expert Selection with Temperature and Stable Softmax
-        # Apply temperature scaling to the logits
-        routing_logits = routing_logits / self.router_temperature
-
-        # Get top-k logits and their indices
-        top_k_logits, top_k_indices = torch.topk(routing_logits, self.top_k, dim=-1)
-
-        # Apply softmax to the selected top-k logits for numerically stable probabilities
-        top_k_probs = F.softmax(top_k_logits, dim=-1, dtype=torch.float32)
         
-        # Calculate routing probabilities over all experts *after* temperature scaling for the aux loss
+        # FIX: First, calculate routing probabilities from ORIGINAL (unscaled) logits.
+        # This is crucial for the auxiliary loss, which should measure the true expert
+        # usage distribution, not one distorted by temperature.
         routing_probs = F.softmax(routing_logits, dim=-1, dtype=torch.float32)
+
+        # Apply temperature scaling to the logits. This will only affect the selection
+        # and weighting of experts for the forward pass, not the auxiliary loss.
+        scaled_routing_logits = routing_logits / self.router_temperature
+
+        # Get top-k logits and their indices from the SCALED logits.
+        top_k_logits, top_k_indices = torch.topk(scaled_routing_logits, self.top_k, dim=-1)
+
+        # Apply softmax to the selected top-k SCALED logits to get the final weights.
+        # These probabilities are used for the weighted sum of expert outputs.
+        top_k_probs = F.softmax(top_k_logits, dim=-1, dtype=torch.float32)
         # --- MODIFICATION END ---
 
         # Step 4: Gather selected expert outputs
