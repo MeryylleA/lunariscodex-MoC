@@ -358,6 +358,11 @@ class CollaborativeExpertsModule(nn.Module):
         token_summary = contextualized_experts.mean(dim=1)  # More efficient than multiple operations
         routing_logits = self.router_gate(token_summary).view(batch_size, seq_len, self.n_experts)
         
+        # Add router noise during training to improve expert utilization
+        if self.training:
+            noise = torch.randn_like(routing_logits) * 1e-2
+            routing_logits = routing_logits + noise
+        
         # Step 3: Efficient expert selection and weighting
         selected_outputs, top_k_probs, routing_probs, top_k_indices = self._efficient_expert_selection(
             routing_logits, expert_outputs
