@@ -260,7 +260,8 @@ class CollaborativeExpertsModule(nn.Module):
     def _compute_auxiliary_loss_efficient(
         self, 
         routing_probs: torch.Tensor,
-        top_k_indices: torch.Tensor
+        top_k_indices: torch.Tensor,
+        attn_weights: torch.Tensor  # NEW
     ) -> torch.Tensor:
         """
         Efficiently compute auxiliary loss with minimal memory allocation.
@@ -272,9 +273,9 @@ class CollaborativeExpertsModule(nn.Module):
         mean_usage = expert_usage.mean()
         balance_loss = ((expert_usage - mean_usage) ** 2).mean()
         
-        # Simple diversity encouragement - penalize concentrated routing
-        routing_entropy = -(routing_probs * torch.log(routing_probs + 1e-8)).sum(dim=-1).mean()
-        diversity_loss = -routing_entropy  # Minimize negative entropy = maximize entropy
+        # NEW: Diversity loss based on cross-attention weights entropy
+        # Calculate entropy of attention weights from collaboration step
+        diversity_loss = -torch.sum(attn_weights * torch.log(attn_weights + 1e-9), dim=-1).mean()
         
         return 0.01 * diversity_loss + 0.01 * balance_loss
 
@@ -308,19 +309,19 @@ class CollaborativeExpertsModule(nn.Module):
         
         return selected_outputs, top_k_probs, routing_probs, top_k_indices
 
-    def _collaborative_fusion_checkpoint(self, selected_outputs: torch.Tensor) -> torch.Tensor:
+    def _collaborative_fusion_checkpoint(self, selected_outputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # MODIFIED
         """Collaborative fusion with optional checkpointing."""
         def fusion_fn(x):
             B, S, K, D = x.shape
             x_flat = x.view(-1, K, D)
             
             # Cross-attention with residual
-            attn_out, _ = self.collab_cross_attn(x_flat, x_flat, x_flat)
+            attn_out, attn_weights = self.collab_cross_attn(x_flat, x_flat, x_flat, need_weights=True)  # MODIFIED
             attn_out = self.collab_norm(attn_out + x_flat)
             
             # FFN refinement with residual
             refined = self.collab_ffn(attn_out) + attn_out
-            return refined.view(B, S, K, D)
+            return refined.view(B, S, K, D), attn_weights  # MODIFIED
         
         if self.use_gradient_checkpointing and self.training:
             return checkpoint(fusion_fn, selected_outputs, use_reentrant=False)
@@ -363,14 +364,14 @@ class CollaborativeExpertsModule(nn.Module):
         )
         
         # Step 4: Collaborative fusion with optional checkpointing
-        refined_outputs = self._collaborative_fusion_checkpoint(selected_outputs)
+        refined_outputs, attn_weights = self._collaborative_fusion_checkpoint(selected_outputs)  # MODIFIED
         
         # Step 5: Final weighted combination with in-place operations
         final_output = torch.sum(refined_outputs * top_k_probs.unsqueeze(-1), dim=2)
         final_output = self.o_proj(final_output)
         
         # Step 6: Efficient auxiliary loss computation
-        aux_loss = self._compute_auxiliary_loss_efficient(routing_probs, top_k_indices)
+        aux_loss = self._compute_auxiliary_loss_efficient(routing_probs, top_k_indices, attn_weights)  # MODIFIED
         aux_loss = aux_loss * self.aux_loss_weight
         
         return final_output, aux_loss
