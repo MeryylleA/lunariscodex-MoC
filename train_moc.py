@@ -314,7 +314,7 @@ def train(config_path: str):
                 with ctx:
                     # The MoE model returns a tuple for loss: (total_loss, main_loss, aux_loss).
                     # We unpack it here. The `expert_indices_list` is also captured for logging.
-                    logits, (loss, main_loss, aux_loss), _, expert_indices_list = model(x, targets=y, past_key_values=None)
+                    logits, loss_tuple, _, expert_indices_list = model(x, targets=y, past_key_values=None)
                     # Scale the loss to account for gradient accumulation.
                     loss = loss / config.gradient_accumulation_steps
 
