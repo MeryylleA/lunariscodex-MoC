@@ -379,7 +379,7 @@ class CollaborativeExpertsModule(nn.Module):
         aux_loss = self._compute_auxiliary_loss_efficient(routing_probs, top_k_indices, attn_weights)  # MODIFIED
         aux_loss = aux_loss * self.aux_loss_weight
         
-        return final_output, aux_loss
+        return final_output, aux_loss, top_k_indices
 
 
 class Block(nn.Module):
