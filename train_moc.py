@@ -199,7 +199,7 @@ def train(config_path: str):
 
         for name, p in raw_model.named_parameters():
             if p.requires_grad:
-                if 'experts' in name:
+                if 'expert' in name.lower():  # More flexible expert parameter detection
                     expert_params += p.numel()
                 else:
                     backbone_params += p.numel()
@@ -214,18 +214,25 @@ def train(config_path: str):
                 if first_moe_block is None:
                     first_moe_block = block
 
-        if first_moe_block:
+        if first_moe_block and hasattr(first_moe_block.feed_forward, 'expert_layer'):
+            # For optimized expert layer
+            for p in first_moe_block.feed_forward.expert_layer.parameters():
+                if p.requires_grad:
+                    params_per_expert += p.numel()
+            params_per_expert = params_per_expert // config.model.n_experts  # Divide by number of experts
+        elif first_moe_block and hasattr(first_moe_block.feed_forward, 'experts'):
+            # For individual experts fallback
             for p in first_moe_block.feed_forward.experts[0].parameters():
                 if p.requires_grad:
                     params_per_expert += p.numel()
 
-        active_params = backbone_params + (num_moe_layers * params_per_expert)
+        active_params = backbone_params + (num_moe_layers * params_per_expert * config.model.top_k)
     # --- End of Parameter Breakdown Logic ---
 
     # --- Start of New Logging Block ---
     if is_master_process:
         print("\n" + "="*80)
-        print(" " * 25 + "LUNARIS CODEX MoE TRAINING")
+        print(" " * 25 + "LUNARIS CODEX MoC TRAINING")
         print("="*80)
 
         print("\n" + "-"*30 + " MODEL & ARCHITECTURE " + "-"*26)
@@ -235,6 +242,7 @@ def train(config_path: str):
             print(f"{'Parameters per Expert:':<35} {params_per_expert/1e6:<8.2f}M")
             print(f"{'Total Expert Parameters:':<35} {expert_params/1e6:<8.2f}M ({config.model.n_experts} experts x {num_moe_layers} layers)")
             print(f"{'Active Parameters per Pass:':<35} {active_params/1e6:<8.2f}M")
+            print(f"{'MoC Configuration:':<35} {config.model.top_k}/{config.model.n_experts} collaborative experts per token")
 
         print("\n" + "-"*36 + " DATA " + "-"*38)
         print(f"{'Dataset Path:':<35} {config.data_dir}")
@@ -246,6 +254,7 @@ def train(config_path: str):
         print(f"{'Max Steps:':<35} {config.max_steps:,}")
         print(f"{'Batch Size (per device):':<35} {config.batch_size}")
         print(f"{'Gradient Accumulation Steps:':<35} {config.gradient_accumulation_steps}")
+        print(f"{'Auxiliary Loss Weight:':<35} {config.model.aux_loss_weight}")
 
         if is_ddp:
             print("\n" + "-"*29 + " DISTRIBUTED SETUP " + "-"*28)
@@ -312,11 +321,18 @@ def train(config_path: str):
                 x, y = x.to(config.device, non_blocking=True), y.to(config.device, non_blocking=True)
 
                 with ctx:
-                    # The MoE model returns a tuple for loss: (total_loss, main_loss, aux_loss).
-                    # We unpack it here. The `expert_indices_list` is also captured for logging.
+                    # The MoC model returns 4 values: (logits, loss_tuple, past_kv, expert_indices)
+                    # We unpack it here. The loss_tuple is (total_loss, main_loss, aux_loss) when targets are provided.
                     logits, loss_tuple, _, expert_indices_list = model(x, targets=y, past_key_values=None)
-                    # Scale the loss to account for gradient accumulation.
-                    loss = loss / config.gradient_accumulation_steps
+                    
+                    # Handle the case where loss_tuple might be None (shouldn't happen with targets, but safety first)
+                    if loss_tuple is not None:
+                        loss, main_loss, aux_loss = loss_tuple
+                        # Scale the loss to account for gradient accumulation.
+                        loss = loss / config.gradient_accumulation_steps
+                    else:
+                        # This should not happen when targets are provided, but handle gracefully
+                        raise ValueError("Expected loss_tuple to be provided when targets are given")
 
                 # Accumulate each loss component separately for accurate logging.
                 accumulated_loss += loss.item()
@@ -370,22 +386,52 @@ def train(config_path: str):
                     }
 
                     # Check if expert routing data is available for logging.
-                    if expert_indices_list:
+                    if expert_indices_list and len(expert_indices_list) > 0:
                         # For visualization, we'll focus on the expert choices in the first MoE layer.
                         first_moe_layer_indices = expert_indices_list[0].detach().cpu()
 
                         # Count the number of tokens routed to each expert.
                         num_experts = raw_model.config.n_experts
                         expert_counts = torch.bincount(first_moe_layer_indices.view(-1), minlength=num_experts)
+                        total_tokens = expert_counts.sum().item()
+
+                        # Calculate utilization percentages and balance metrics
+                        expert_percentages = (expert_counts.float() / total_tokens * 100).tolist()
+                        
+                        # Calculate load balance - how evenly distributed the tokens are
+                        ideal_percentage = 100.0 / num_experts
+                        balance_variance = sum((pct - ideal_percentage) ** 2 for pct in expert_percentages) / num_experts
+                        balance_score = max(0, 100 - balance_variance)  # Higher is better
+                        
+                        # Log individual expert utilization percentages
+                        for i, pct in enumerate(expert_percentages):
+                            log_data[f"expert_util/expert_{i}_pct"] = pct
+                        
+                        # Log balance metrics
+                        log_data["expert_util/balance_score"] = balance_score
+                        log_data["expert_util/balance_variance"] = balance_variance
+                        log_data["expert_util/max_utilization"] = max(expert_percentages)
+                        log_data["expert_util/min_utilization"] = min(expert_percentages)
 
                         # Create a wandb.Table to be plotted as a bar chart.
-                        table = wandb.Table(columns=["Expert ID", "Token Count"])
+                        table = wandb.Table(columns=["Expert ID", "Token Count", "Percentage"])
                         for i in range(num_experts):
-                            table.add_data(f"Expert {i}", expert_counts[i].item())
+                            table.add_data(f"Expert {i}", expert_counts[i].item(), expert_percentages[i])
 
                         # Add the bar chart plot to our logging dictionary.
                         log_data["expert_utilization/layer_0"] = wandb.plot.bar(
-                            table, "Expert ID", "Token Count", title="Expert Utilization (Layer 0)"
+                            table, "Expert ID", "Token Count", 
+                            title=f"Expert Utilization (Layer 0) - Balance Score: {balance_score:.1f}"
+                        )
+
+                        # Also create percentage bar chart
+                        pct_table = wandb.Table(columns=["Expert ID", "Percentage"])
+                        for i in range(num_experts):
+                            pct_table.add_data(f"Expert {i}", expert_percentages[i])
+                        
+                        log_data["expert_utilization/layer_0_percentage"] = wandb.plot.bar(
+                            pct_table, "Expert ID", "Percentage",
+                            title=f"Expert Utilization % (Layer 0) - Ideal: {ideal_percentage:.1f}%"
                         )
 
                     # Log all metrics for this step to W&B at once.
@@ -415,7 +461,7 @@ def train(config_path: str):
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description="Train a LunarisCodex-MoE model.")
-    parser.add_argument("config", type=str, help="Path to the MoE config.yaml file.")
+    parser = argparse.ArgumentParser(description="Train a LunarisCodex-MoC model.")
+    parser.add_argument("config", type=str, help="Path to the MoC config.yaml file.")
     args = parser.parse_args()
     train(args.config)
