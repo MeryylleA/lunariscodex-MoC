@@ -61,16 +61,18 @@ MoC answers the question:
 
 #### How it Works
 ```python
-# 1. Forward through ALL experts in parallel
-expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)
+# 1. Get ALL expert outputs in a single, parallel batch operation
+expert_outputs = self.expert_layer(x)  # Shape: (B, S, n_experts, d_model)
 
-# 2. Self-attention over all expert outputs
+# 2. Reshape and let experts "see" each other's outputs via self-attention
+expert_flat = expert_outputs.view(-1, self.n_experts, self.d_model)
 contextualized, _ = self.router_self_attn(
     expert_flat, expert_flat, expert_flat
 )
 
-# 3. Route with contextualized information
-routing_logits = self.router_gate(contextualized.mean(1))
+# 3. Route using this new, rich contextual information
+token_summary = contextualized.mean(dim=1)
+routing_logits = self.router_gate(token_summary)
 ```
 
 #### Why it Matters
@@ -114,17 +116,22 @@ To keep training stable and collaboration meaningful, MoC employs a **composite 
 | **Diversity Loss** | Prevent collapse in cross-attention patterns. | Maximize entropy of cross-attention weights. |
 
 ```python
-def compute_diversity_loss(attn_weights, routing_probs):
-    # Diversity: maximize entropy of cross-attention
-    attn_entropy = -torch.sum(
-        attn_weights * torch.log(attn_weights + 1e-8), dim=-1
+def _compute_auxiliary_loss_efficient(
+    self, 
+    routing_probs: torch.Tensor,
+    attn_weights: torch.Tensor
+) -> torch.Tensor:
+    # Expert usage balance loss
+    expert_usage = routing_probs.mean(dim=(0, 1))
+    balance_loss = ((expert_usage - expert_usage.mean()) ** 2).mean()
+
+    # Diversity loss based on collaboration entropy
+    diversity_loss = -torch.sum(
+        attn_weights * torch.log(attn_weights + 1e-9), dim=-1
     ).mean()
-
-    # Balance: minimize variance of expert usage
-    expert_usage = routing_probs.mean(dim=[0, 1])
-    balance_loss = torch.var(expert_usage)
-
-    return 0.01 * (-attn_entropy) + 0.01 * balance_loss
+    
+    # Return the combined, scaled loss
+    return 0.01 * diversity_loss + 0.01 * balance_loss
 ```
 
 ---
@@ -161,6 +168,8 @@ Final Output:    (B, S, d_model)
 - **MoE (train)**: O(B·S·k·d_model²)  
 - **MoC (train)**: O(B·S·n_experts·d_model²)  
 > **Trade-off**: Higher compute for richer collaboration.
+
+> For a more condensed technical specification of the MoC module, see the [MoC Design Document (MoC.md)](./MoC.md).
 
 ---
 
@@ -210,12 +219,13 @@ python train_moc.py config_moc.yaml
 ### Monitoring and Debugging
 
 #### Key Metrics to Watch
-| Metric | Where to Log | Healthy Range |
-|--------|--------------|---------------|
+| Metric | Where to Log | Healthy Range / Goal |
+|--------|--------------|----------------------|
 | **loss/main** | W&B, tqdm | Steady decrease |
-| **loss/aux** | W&B, tqdm | Stable, ≈ 1–2 % of main loss |
+| **loss/aux** | W&B, tqdm | Stable, ~1–5% of main loss |
 | **perplexity** | W&B | Calculated from `loss/main`; should improve |
-| **Expert usage variance** | Manual | Low; aim for uniform distribution |
+| **expert_util/balance_score** | W&B | High (closer to 100). Indicates even load. |
+| **expert_utilization/layer_0** | W&B (Bar Chart) | All bars should have similar heights. Avoids expert collapse. |
 
 #### Common Issues & Fixes
 | Symptom | Likely Cause | Fix |
