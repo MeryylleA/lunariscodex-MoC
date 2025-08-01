@@ -1,86 +1,86 @@
 # Mixture of Collaborative Experts (MoC)
 
-Uma arquitetura avançada de Mixture of Experts com colaboração entre especialistas
+An advanced Mixture-of-Experts architecture with collaboration between specialists
 
 ---
 
-## 📋 Visão Geral
+## Overview
 
-A Mixture of Collaborative Experts (MoC) é uma evolução do tradicional Mixture of Experts (MoE) que introduz colaboração inteligente entre os especialistas selecionados. Ao invés de simplesmente combinar as saídas dos experts de forma independente, a MoC permite que os experts colaborem através de cross-attention antes da fusão final.
+The Mixture of Collaborative Experts (MoC) is an evolution of the traditional Mixture of Experts (MoE) that introduces intelligent collaboration among the selected experts. Instead of simply combining expert outputs independently, MoC lets experts collaborate via cross-attention before the final fusion.
 
-### Diferenças Fundamentais do MoE Tradicional
+### Fundamental Differences from Traditional MoE
 
-| Aspecto | MoE Tradicional | MoC (Nossa Implementação) |
-|---------|----------------|---------------------------|
-| Seleção de Experts | Router simples com softmax | Router contextualizado com self-attention |
-| Colaboração | Nenhuma - experts independentes | Cross-attention entre experts selecionados |
-| Auxiliary Loss | Load balancing básico | Diversity + Balance combinados |
-| Estabilidade | Problemas de renormalização | Softmax direto nos logits |
+| Aspect | Traditional MoE | MoC (Our Implementation) |
+|--------|------------------|--------------------------|
+| Expert Selection | Simple router with softmax | Contextualized router with self-attention |
+| Collaboration | None — experts are independent | Cross-attention between selected experts |
+| Auxiliary Loss | Basic load balancing | Combined Diversity + Balance |
+| Stability | Renormalization issues | Direct softmax on logits |
 
 ---
 
-## 🏗️ Arquitetura Detalhada
+## Architecture Details
 
-### Componentes Principais
+### Main Components
 
 #### 1. Router Contextualization
 
 ```python
-# Self-attention sobre TODOS os expert outputs
+# Self-attention over ALL expert outputs
 contextualized_experts, _ = self.router_self_attn(
     expert_flat, expert_flat, expert_flat
 )
 ```
 
-**Por que isso é importante:**
-- O router não decide baseado apenas no input token
-- Considera as saídas de todos os experts para fazer uma seleção mais informada
-- Permite routing adaptativo baseado no contexto completo
+Why this matters:
+- The router doesn’t decide based only on the input token
+- It considers all experts’ outputs to make a more informed selection
+- Enables adaptive routing based on full context
 
-#### 2. Top-K Selection com Temperature
+#### 2. Top-K Selection with Temperature
 
 ```python
-# Temperature scaling para controle de distribuição
+# Temperature scaling to control distribution sharpness
 routing_logits = routing_logits / self.router_temperature
 
-# Seleção estável dos top-k experts
+# Stable top-k selection
 topk_logits, topk_indices = torch.topk(routing_logits, self.top_k, dim=-1)
 topk_probs = F.softmax(topk_logits, dim=-1)
 ```
 
-**Vantagens:**
-- Numericamente mais estável que renormalização manual
-- Temperature permite controlar sharpness da distribuição
-- Evita problemas de divisão por zero
+Advantages:
+- Numerically more stable than manual renormalization
+- Temperature controls distribution sharpness
+- Avoids division-by-zero issues
 
 #### 3. Collaborative Fusion
 
 ```python
-# Cross-attention entre experts selecionados
+# Cross-attention between selected experts
 collaborative_outputs, collab_attn = self.collab_cross_attn(
     selected_flat, selected_flat, selected_flat
 )
 
-# Refinement adicional
+# Additional refinement
 refined_outputs = self.collab_ffn(collaborative_outputs) + collaborative_outputs
 ```
 
-**O diferencial:**
-- Experts selecionados "conversam" entre si via cross-attention
-- Refinement FFN adicional para melhorar a colaboração
-- Residual connections para estabilidade de treino
+What’s different:
+- Selected experts “talk” via cross-attention
+- Additional FFN refinement to improve collaboration
+- Residual connections for training stability
 
 #### 4. Advanced Auxiliary Loss
 
 ```python
 def compute_diversity_loss(self, cross_attn_weights, routing_probs):
-    # Diversity: maximizar entropia da cross-attention
+    # Diversity: maximize cross-attention entropy
     attn_entropy = -torch.sum(
         cross_attn_weights * torch.log(cross_attn_weights + 1e-8), dim=-1
     ).mean()
     diversity_loss = -attn_entropy
     
-    # Balance: minimizar variância do uso dos experts
+    # Balance: minimize variance of expert usage
     expert_usage = routing_probs.mean(dim=[0, 1])
     balance_loss = torch.var(expert_usage)
     
@@ -89,33 +89,33 @@ def compute_diversity_loss(self, cross_attn_weights, routing_probs):
 
 ---
 
-## 🔄 Fluxo de Processamento
+## Processing Flow
 
 ### Step-by-Step
 
-1. **Input Processing**
-   - Recebe tokens: (batch_size, seq_len, d_model)
-   - Processa através de TODOS os experts em paralelo
+1. Input Processing
+   - Receives tokens: (batch_size, seq_len, d_model)
+   - Processes through ALL experts in parallel
 
-2. **Router Contextualization**
-   - Self-attention sobre todas as saídas dos experts
-   - Gera representação contextualizada para routing
+2. Router Contextualization
+   - Self-attention over all expert outputs
+   - Generates a contextualized representation for routing
 
-3. **Expert Selection**
-   - Aplica temperature scaling nos routing logits
-   - Seleciona top-k experts via torch.topk()
-   - Calcula probabilidades com softmax estável
+3. Expert Selection
+   - Applies temperature scaling to routing logits
+   - Selects top-k experts via torch.topk()
+   - Computes probabilities with stable softmax
 
-4. **Collaborative Fusion**
-   - Cross-attention entre experts selecionados
-   - Refinement via FFN adicional
-   - Residual connections para estabilidade
+4. Collaborative Fusion
+   - Cross-attention among selected experts
+   - Refinement via an additional FFN
+   - Residual connections for stability
 
-5. **Final Output**
-   - Combinação ponderada das saídas colaborativas
-   - Projeção final + auxiliary loss
+5. Final Output
+   - Weighted combination of collaborative outputs
+   - Final projection + auxiliary loss
 
-### Dimensões dos Tensors
+### Tensor Dimensions
 
 ```
 Input: (B, S, d_model)
@@ -127,85 +127,85 @@ Final Output: (B, S, d_model)
 
 ---
 
-## ⚙️ Configuração
+## Configuration
 
-### Parâmetros Principais
+### Key Parameters
 
 ```python
 @dataclass
 class LunarisCodexConfig:
     # MoC Specific Parameters
-    n_experts: int = 8                    # Número total de experts
-    top_k: int = 2                        # Quantos experts selecionar
-    aux_loss_weight: float = 1e-2         # Peso da auxiliary loss
-    router_temperature: float = 1.0       # Temperature para routing
+    n_experts: int = 8                    # Total number of experts
+    top_k: int = 2                        # How many experts to select
+    aux_loss_weight: float = 1e-2         # Auxiliary loss weight
+    router_temperature: float = 1.0       # Routing temperature
 ```
 
-### Recomendações de Configuração
+### Configuration Recommendations
 
-| Parâmetro | Valor Recomendado | Justificativa |
-|-----------|------------------|---------------|
-| n_experts | 8-16 | Balance entre capacidade e eficiência |
-| top_k | 2-4 | Permite colaboração sem overhead excessivo |
-| aux_loss_weight | 1e-2 a 1e-3 | Suficiente para regularização |
-| router_temperature | 0.5-2.0 | 1.0 = neutro, <1.0 = mais sharp, >1.0 = mais suave |
+| Parameter | Recommended Value | Rationale |
+|-----------|-------------------|-----------|
+| n_experts | 8–16 | Balance capacity and efficiency |
+| top_k | 2–4 | Enables collaboration without excessive overhead |
+| aux_loss_weight | 1e-2 to 1e-3 | Adequate for regularization |
+| router_temperature | 0.5–2.0 | 1.0 = neutral, <1.0 = sharper, >1.0 = smoother |
 
 ---
 
-## 🧮 Análise Matemática
+## Mathematical Analysis
 
-### Complexidade Computacional
+### Computational Complexity
 
-**Forward Pass:**
+Forward Pass:
 - Expert computation: O(B × S × n_experts × d_model²)
 - Router self-attention: O(B × S × n_experts² × d_model)
 - Cross-attention: O(B × S × top_k² × d_model)
-- **Total: O(B × S × n_experts × d_model²) (dominante)**
+- Total: O(B × S × n_experts × d_model²) (dominant)
 
-**Comparação com MoE tradicional:**
+Comparison with traditional MoE:
 - MoE: O(B × S × top_k × d_model²)
-- MoC: O(B × S × n_experts × d_model²) (durante treino)
-- **Trade-off: Maior custo computacional por melhor qualidade**
+- MoC: O(B × S × n_experts × d_model²) (during training)
+- Trade-off: Higher computational cost for better quality
 
 ### Auxiliary Loss Breakdown
 
-**Diversity Loss: Encoraja padrões diversos na cross-attention**
-- Previne collapse dos experts
-- Maximiza entropia das attention weights
+Diversity Loss: Encourages diverse cross-attention patterns
+- Prevents expert collapse
+- Maximizes attention weight entropy
 
-**Balance Loss: Garante uso equilibrado dos experts**
-- Minimiza variância do expert usage
-- Evita que alguns experts sejam ignorados
-
----
-
-## 🚀 Vantagens da MoC
-
-### 1. Melhor Especialização
-- Experts colaboram ao invés de competir
-- Cada expert pode focar em aspectos específicos
-- Combinação inteligente de conhecimentos
-
-### 2. Routing Contextualizado
-- Decisões de routing mais informadas
-- Considera output de todos os experts
-- Adaptativo ao contexto atual
-
-### 3. Estabilidade de Treino
-- Auxiliary loss bem balanceada
-- Softmax numericamente estável
-- Residual connections para gradientes
-
-### 4. Flexibilidade
-- Temperature permite tuning fino
-- Configurável para diferentes tarefas
-- Escalável para mais experts
+Balance Loss: Ensures balanced expert usage
+- Minimizes variance of expert usage
+- Prevents experts from being ignored
 
 ---
 
-## 🔧 Implementação
+## Advantages of MoC
 
-### Integração no Transformer
+### 1. Better Specialization
+- Experts collaborate instead of competing
+- Each expert can focus on specific aspects
+- Intelligent combination of knowledge
+
+### 2. Contextualized Routing
+- More informed routing decisions
+- Considers outputs from all experts
+- Adaptive to the current context
+
+### 3. Training Stability
+- Well-balanced auxiliary loss
+- Numerically stable softmax
+- Residual connections preserve gradients
+
+### 4. Flexibility
+- Temperature allows fine-tuning
+- Configurable for different tasks
+- Scales to more experts
+
+---
+
+## Implementation
+
+### Transformer Integration
 
 ```python
 class Block(nn.Module):
@@ -223,34 +223,34 @@ class Block(nn.Module):
 ### Training Loop Considerations
 
 ```python
-# Durante o forward pass
+# During forward pass
 logits, loss, past_key_values = model(idx, targets=targets)
 
 if loss is not None:
     total_loss, main_loss, aux_loss = loss
-    # total_loss já inclui auxiliary loss ponderada
+    # total_loss already includes the weighted auxiliary loss
     total_loss.backward()
 ```
 
 ---
 
-## 📊 Monitoramento e Debug
+## Monitoring and Debug
 
-### Métricas Importantes
+### Important Metrics
 
-**Expert Usage Distribution**
+Expert Usage Distribution
 ```python
 expert_usage = routing_probs.mean(dim=[0, 1])
 print(f"Expert usage variance: {torch.var(expert_usage):.4f}")
 ```
 
-**Auxiliary Loss Components**
+Auxiliary Loss Components
 ```python
 print(f"Diversity loss: {diversity_loss:.4f}")
 print(f"Balance loss: {balance_loss:.4f}")
 ```
 
-**Routing Entropy**
+Routing Entropy
 ```python
 routing_entropy = -torch.sum(routing_probs * torch.log(routing_probs + 1e-8), dim=-1).mean()
 print(f"Routing entropy: {routing_entropy:.4f}")
@@ -258,30 +258,30 @@ print(f"Routing entropy: {routing_entropy:.4f}")
 
 ---
 
-## 🎯 Casos de Uso
+## Use Cases
 
-### Quando Usar MoC
+### When to Use MoC
 
-✅ **Ideal para:**
-- Tarefas que requerem diferentes tipos de raciocínio
-- Modelos grandes onde eficiência é importante
-- Cenários com dados diversificados
-- Quando você quer melhor interpretabilidade
+✅ Ideal for:
+- Tasks requiring different kinds of reasoning
+- Large models where efficiency matters
+- Diverse datasets
+- When interpretability is desired
 
-❌ **Evitar quando:**
-- Modelos muito pequenos (overhead não compensa)
-- Tarefas muito específicas/homogêneas
-- Recursos computacionais muito limitados
-- Prototipagem rápida (use FFN padrão primeiro)
+❌ Avoid when:
+- Very small models (overhead may not pay off)
+- Highly specific/homogeneous tasks
+- Severely limited compute resources
+- Rapid prototyping (use standard FFN first)
 
 ---
 
-## 🔬 Experimentos e Tuning
+## Experiments and Tuning
 
-### Hyperparameter Sweep Sugerido
+### Suggested Hyperparameter Sweep
 
 ```python
-# Configurações para testar
+# Configurations to test
 configs = [
     {"n_experts": 8, "top_k": 2, "router_temperature": 1.0},
     {"n_experts": 8, "top_k": 3, "router_temperature": 0.7},
@@ -290,60 +290,60 @@ configs = [
 ```
 
 ### Ablation Studies
-- **Sem Router Contextualization:** Remove self-attention do router
-- **Sem Collaborative Fusion:** Remove cross-attention entre experts
-- **Auxiliary Loss Components:** Teste diversity vs balance separadamente
+- Without Router Contextualization: Remove router self-attention
+- Without Collaborative Fusion: Remove cross-attention among experts
+- Auxiliary Loss Components: Test diversity vs. balance separately
 
 ---
 
-## 📚 Referências e Inspirações
+## References and Inspirations
 
-### Papers Relacionados
-- **Switch Transformer:** Fundação do MoE moderno
-- **GLaM:** Scaling MoE para modelos gigantes
-- **Expert Choice:** Routing improvements
+### Related Papers
+- Switch Transformer: Foundation of modern MoE
+- GLaM: Scaling MoE to massive models
+- Expert Choice: Routing improvements
 
-### Diferenças da Nossa Implementação
-- Router contextualization com self-attention
+### Differences in Our Implementation
+- Router contextualization with self-attention
 - Collaborative fusion via cross-attention
-- Auxiliary loss combinada (diversity + balance)
-- Integração limpa com arquitetura Llama-style
+- Combined auxiliary loss (diversity + balance)
+- Clean integration with a Llama-style architecture
 
 ---
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
-### Problemas Comuns
+### Common Issues
 
-**Auxiliary Loss Muito Alta**
-- Reduza aux_loss_weight
-- Verifique se diversity e balance estão balanceados
+Auxiliary Loss Too High
+- Reduce aux_loss_weight
+- Check balance between diversity and balance components
 
-**Experts Não Sendo Usados**
-- Aumente router_temperature
-- Verifique inicialização dos pesos
+Experts Not Being Used
+- Increase router_temperature
+- Verify weight initialization
 
-**Instabilidade de Treino**
-- Reduza learning rate
-- Verifique gradient clipping
+Training Instability
+- Reduce learning rate
+- Check gradient clipping
 
-**Overfitting**
-- Aumente dropout
-- Reduza número de experts ou top_k
-
----
-
-## 💡 Ideias para Extensões Futuras
-
-- **Dynamic Top-K:** Ajustar top_k baseado no contexto
-- **Hierarchical Experts:** Experts especializados em diferentes níveis
-- **Memory-Augmented Routing:** Router com memória de decisões passadas
-- **Multi-Scale Collaboration:** Cross-attention em diferentes escalas
+Overfitting
+- Increase dropout
+- Reduce number of experts or top_k
 
 ---
 
-**Criado por:** Francisco  
-**Data:** Julho 2025  
-**Versão:** 1.0
+## Ideas for Future Extensions
 
-> "A ideia é simples: ao invés de experts competindo, eles colaboram. E essa colaboração acontece através de cross-attention, permitindo que cada expert refine sua saída baseado no que os outros experts estão 'pensando'."
+- Dynamic Top-K: Adjust top_k based on context
+- Hierarchical Experts: Experts specialized at multiple levels
+- Memory-Augmented Routing: Router with memory of past decisions
+- Multi-Scale Collaboration: Cross-attention at different scales
+
+---
+
+Created by: Francisco  
+Date: July 2025  
+Version: 1.0
+
+> "The idea is simple: instead of experts competing, they collaborate. This collaboration happens through cross-attention, allowing each expert to refine its output based on what the other experts are ‘thinking’."
