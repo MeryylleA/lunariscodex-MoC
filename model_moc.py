@@ -261,7 +261,7 @@ class CollaborativeExpertsModule(nn.Module):
         self, 
         routing_probs: torch.Tensor,
         top_k_indices: torch.Tensor,
-        attn_weights: torch.Tensor  # NEW
+        attn_weights: torch.Tensor
     ) -> torch.Tensor:
         """
         Efficiently compute auxiliary loss with minimal memory allocation.
@@ -273,7 +273,7 @@ class CollaborativeExpertsModule(nn.Module):
         mean_usage = expert_usage.mean()
         balance_loss = ((expert_usage - mean_usage) ** 2).mean()
         
-        # NEW: Diversity loss based on cross-attention weights entropy
+        # Diversity loss based on cross-attention weights entropy
         # Calculate entropy of attention weights from collaboration step
         diversity_loss = -torch.sum(attn_weights * torch.log(attn_weights + 1e-9), dim=-1).mean()
         
@@ -309,28 +309,33 @@ class CollaborativeExpertsModule(nn.Module):
         
         return selected_outputs, top_k_probs, routing_probs, top_k_indices
 
-    def _collaborative_fusion_checkpoint(self, selected_outputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # MODIFIED
+    def _collaborative_fusion_checkpoint(self, selected_outputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Collaborative fusion with optional checkpointing."""
         def fusion_fn(x):
             B, S, K, D = x.shape
             x_flat = x.view(-1, K, D)
             
             # Cross-attention with residual
-            attn_out, attn_weights = self.collab_cross_attn(x_flat, x_flat, x_flat, need_weights=True)  # MODIFIED
+            attn_out, attn_weights = self.collab_cross_attn(x_flat, x_flat, x_flat, need_weights=True)
             attn_out = self.collab_norm(attn_out + x_flat)
             
             # FFN refinement with residual
             refined = self.collab_ffn(attn_out) + attn_out
-            return refined.view(B, S, K, D), attn_weights  # MODIFIED
+            return refined.view(B, S, K, D), attn_weights
         
         if self.use_gradient_checkpointing and self.training:
             return checkpoint(fusion_fn, selected_outputs, use_reentrant=False)
         else:
             return fusion_fn(selected_outputs)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Optimized forward pass with reduced memory allocation and improved efficiency.
+        
+        Returns:
+            final_output: (B, S, d_model) - The final output after expert collaboration
+            aux_loss: scalar - Auxiliary loss for expert load balancing
+            top_k_indices: (B, S, top_k) - Expert indices selected for each token
         """
         batch_size, seq_len, d_model = x.shape
         
@@ -369,14 +374,14 @@ class CollaborativeExpertsModule(nn.Module):
         )
         
         # Step 4: Collaborative fusion with optional checkpointing
-        refined_outputs, attn_weights = self._collaborative_fusion_checkpoint(selected_outputs)  # MODIFIED
+        refined_outputs, attn_weights = self._collaborative_fusion_checkpoint(selected_outputs)
         
         # Step 5: Final weighted combination with in-place operations
         final_output = torch.sum(refined_outputs * top_k_probs.unsqueeze(-1), dim=2)
         final_output = self.o_proj(final_output)
         
         # Step 6: Efficient auxiliary loss computation
-        aux_loss = self._compute_auxiliary_loss_efficient(routing_probs, top_k_indices, attn_weights)  # MODIFIED
+        aux_loss = self._compute_auxiliary_loss_efficient(routing_probs, top_k_indices, attn_weights)
         aux_loss = aux_loss * self.aux_loss_weight
         
         return final_output, aux_loss, top_k_indices
@@ -404,22 +409,23 @@ class Block(nn.Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         # Attention with residual
         attn_output, new_kv = self.attention(self.attention_norm(x), freqs_cis, past_kv)
         h = x + attn_output
 
         # FFN with residual
         aux_loss = None
+        expert_indices = None
         ffn_input = self.ffn_norm(h)
 
         if self.is_moe:
-            ffn_output, aux_loss = self.feed_forward(ffn_input)
+            ffn_output, aux_loss, expert_indices = self.feed_forward(ffn_input)
         else:
             ffn_output = self.feed_forward(ffn_input)
 
         out = h + ffn_output
-        return out, new_kv, aux_loss
+        return out, new_kv, aux_loss, expert_indices
 
 
 class LunarisCodex(nn.Module):
@@ -496,7 +502,7 @@ class LunarisCodex(nn.Module):
         idx: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-    ) -> Tuple[torch.Tensor, Optional[tuple], List[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[Tuple], List[Tuple[torch.Tensor, torch.Tensor]], Optional[List[torch.Tensor]]]:
         B, T = idx.shape
         start_pos = past_key_values[0][0].shape[-2] if past_key_values is not None else 0
         
@@ -510,13 +516,17 @@ class LunarisCodex(nn.Module):
         # Process through transformer blocks
         new_past_key_values = []
         total_aux_loss = 0.0
+        all_expert_indices = []
 
         for i, block in enumerate(self.transformer.h):
             past_kv_for_block = past_key_values[i] if past_key_values is not None else None
-            x, new_kv, aux_loss = block(x, freqs_cis, past_kv_for_block)
+            x, new_kv, aux_loss, expert_indices = block(x, freqs_cis, past_kv_for_block)
             
             if aux_loss is not None:
                 total_aux_loss = total_aux_loss + aux_loss  # Avoid += for potential in-place issues
+            
+            if expert_indices is not None:
+                all_expert_indices.append(expert_indices)
             
             new_past_key_values.append(new_kv)
 
@@ -524,7 +534,7 @@ class LunarisCodex(nn.Module):
         x = self.transformer.ln_f(x)
 
         # Compute loss if targets provided
-        loss = None
+        loss_tuple = None
         if targets is not None:
             logits = self.lm_head(x)
             main_loss = F.cross_entropy(
@@ -538,12 +548,15 @@ class LunarisCodex(nn.Module):
             final_aux_loss = total_aux_loss / max(num_moe_layers, 1)  # Avoid division by zero
             
             total_loss = main_loss + final_aux_loss
-            loss = (total_loss, main_loss, final_aux_loss)
+            loss_tuple = (total_loss, main_loss, final_aux_loss)
         else:
             # Generation mode - only compute logits for last token
             logits = self.lm_head(x[:, [-1], :])
 
-        return logits, loss, new_past_key_values
+        # Return expert indices only if we have MoE layers, otherwise None
+        expert_indices_result = all_expert_indices if all_expert_indices else None
+        
+        return logits, loss_tuple, new_past_key_values, expert_indices_result
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # Separate parameters for weight decay
@@ -587,8 +600,8 @@ class LunarisCodex(nn.Module):
             # Only use last token if we have past_key_values
             idx_cond = idx if past_key_values is None else idx[:, -1:]
             
-            # Forward pass
-            logits, _, past_key_values = self(idx_cond, past_key_values=past_key_values)
+            # Forward pass - note the 4 return values
+            logits, _, past_key_values, _ = self(idx_cond, past_key_values=past_key_values)
             
             # Sample next token
             logits = logits[:, -1, :] / temperature
