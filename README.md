@@ -204,7 +204,7 @@ Recommended settings:
 
 ### Running the Training
 ```bash
-python train_moe.py config_moc.yaml
+python train_moc.py config_moc.yaml
 ```
 
 ### Monitoring and Debugging
