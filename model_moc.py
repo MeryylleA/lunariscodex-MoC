@@ -1,21 +1,7 @@
-"""
-Optimized CollaborativeExpertsModule with PyTorch-level performance improvements.
-
-Key optimizations:
-1. Expert parallelization using batch operations instead of stack/loop
-2. Memory-efficient attention with optimized reshaping
-3. Reduced tensor operations and intermediate allocations
-4. Optional gradient checkpointing support
-5. In-place operations where safe
-6. Efficient indexing operations
-7. Optimized auxiliary loss computation
-"""
-
 import math
-from dataclasses import dataclass
 import inspect
+from dataclasses import dataclass
 from typing import Optional, Tuple, List
-import warnings
 
 import torch
 import torch.nn as nn
@@ -25,9 +11,6 @@ from torch.utils.checkpoint import checkpoint
 
 @dataclass
 class LunarisCodexConfig:
-    """
-    Configuration class for the LunarisCodex model.
-    """
     d_model: int = 768
     n_layers: int = 12
     n_heads: int = 12
@@ -38,32 +21,41 @@ class LunarisCodexConfig:
     max_seq_len: int = 1024
     rope_theta: float = 10000.0
     dropout: float = 0.0
-    # --- MoC Params ---
+
+    # MoE / MoC parameters
     n_experts: Optional[int] = 8
-    top_k: int = 2
-    aux_loss_weight: float = 0.1
-    router_temperature: float = 1.0
-    # --- New optimization params ---
-    use_gradient_checkpointing: bool = False
-    enable_expert_parallelism: bool = True
+    top_k: int = 2  # fixed top-k > 1
+    aux_loss_weight: float = 1e-2
+    capacity_factor: float = 1.25
+    router_z_loss_weight: float = 1e-3
+
+    # Engineering
+    use_gradient_checkpointing: bool = True  # safe default for single-GPU
+    save_attn_weights: bool = False          # for debugging collaboration
+
+    # New simple collab flags (default keeps legacy MHA behavior)
+    use_simple_collab: bool = False
+    simple_collab_dropout: float = 0.1
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    t = torch.arange(end, dtype=torch.float32)  # device set when registered as buffer
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
+
 def apply_rotary_emb(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # xq, xk: [B, H, T, D]
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)  # [1,1,T,D/2]
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    return xq_out.to(dtype=xq.dtype), xk_out.to(dtype=xk.dtype)
 
 
 class Attention(nn.Module):
@@ -73,15 +65,15 @@ class Attention(nn.Module):
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
         self.head_dim = config.d_model // config.n_heads
-        self.q_proj = nn.Linear(config.d_model, config.n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.d_model, config.n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.d_model, config.n_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(config.n_heads * self.head_dim, config.d_model, bias=False)
-        self.dropout = nn.Dropout(config.dropout)
 
-        # QK-Reorder-LN: per-tensor RMSNorm for Q and K before RoPE
         q_size = self.n_heads * self.head_dim
         kv_size = self.n_kv_heads * self.head_dim
+
+        self.wqkv = nn.Linear(config.d_model, q_size + 2 * kv_size, bias=False)
+        self.o_proj = nn.Linear(q_size, config.d_model, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+
+        # QK-Reorder-LN: Norm only Q and K
         self.q_norm = nn.RMSNorm(q_size, eps=1e-5)
         self.k_norm = nn.RMSNorm(kv_size, eps=1e-5)
 
@@ -92,27 +84,39 @@ class Attention(nn.Module):
         past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         B, T, C = x.shape
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
 
-        # QK-Reorder-LN: normalize Q and K prior to RoPE
+        qkv = self.wqkv(x)
+        q, k, v = torch.split(
+            qkv,
+            [self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim, self.n_kv_heads * self.head_dim],
+            dim=-1,
+        )
+
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # [B, H, T, D]
         k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
         q, k = apply_rotary_emb(q, k, freqs_cis)
+
         if past_kv is not None:
             past_k, past_v = past_kv
             k = torch.cat((past_k, k), dim=-2)
             v = torch.cat((past_v, v), dim=-2)
+
         present_kv = (k, v)
+
         if self.n_kv_heads < self.n_heads:
             n_repeats = self.n_heads // self.n_kv_heads
             k = k.repeat_interleave(n_repeats, dim=1)
             v = v.repeat_interleave(n_repeats, dim=1)
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
         is_causal = past_kv is None
         y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -126,324 +130,315 @@ class FeedForward(nn.Module):
         hidden_dim = int(config.ffn_hidden_multiplier * config.d_model)
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
-        self.w1 = nn.Linear(config.d_model, hidden_dim, bias=False)
-        self.w3 = nn.Linear(config.d_model, hidden_dim, bias=False)
+
+        # Fused SwiGLU-style MLP (w13 chunk)
+        self.w13 = nn.Linear(config.d_model, 2 * hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor):
-        swiglu = F.silu(self.w1(x)) * self.w3(x)
+        gate, up = self.w13(x).chunk(2, dim=-1)
+        swiglu = F.silu(gate) * up
         return self.dropout(self.w2(swiglu))
 
 
-class OptimizedExpertLayer(nn.Module):
+class MoCTopKExperts(nn.Module):
     """
-    Optimized expert layer that can process multiple inputs in parallel.
-    """
-    def __init__(self, config: LunarisCodexConfig, n_experts: int):
-        super().__init__()
-        self.n_experts = n_experts
-        self.d_model = config.d_model
+    MoC core on top of optimized MoE foundation.
+    Key merges from model_moe.py:
+      - Capacity-aware dispatch with contiguous permutation
+      - Router z-loss and load-balancing loss
+      - No probability scaling of expert outputs before fusion
+      - Fused FFN per expert
+    MoC additions from model_moc.py (core only):
+      - top_k > 1 routing (fixed K)
+      - cross-attention collaboration among K expert outputs per token (single round)
+      - weighted fusion by normalized top-k logits
 
-        # Calculate FFN dimensions
-        hidden_dim = int(config.ffn_hidden_multiplier * config.d_model)
-        hidden_dim = int(2 * hidden_dim / 3)
-        hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
-
-        # Batched expert parameters for parallel computation
-        self.w1 = nn.Parameter(torch.randn(n_experts, config.d_model, hidden_dim) * 0.02)
-        self.w3 = nn.Parameter(torch.randn(n_experts, config.d_model, hidden_dim) * 0.02)
-        self.w2 = nn.Parameter(torch.randn(n_experts, hidden_dim, config.d_model) * 0.02)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parallel expert computation.
-        Args:
-            x: (batch_size, seq_len, d_model)
-        Returns:
-            expert_outputs: (batch_size, seq_len, n_experts, d_model)
-        """
-        B, S, D = x.shape
-
-        # Reshape for batched matrix multiplication: (B*S, 1, D) @ (n_experts, D, hidden_dim)
-        x_reshaped = x.view(B * S, 1, D)
-
-        # Parallel computation for all experts
-        # (B*S, n_experts, hidden_dim)
-        gate_out = torch.bmm(x_reshaped.expand(-1, self.n_experts, -1), self.w1.transpose(0, 1).transpose(1, 2))
-        up_out = torch.bmm(x_reshaped.expand(-1, self.n_experts, -1), self.w3.transpose(0, 1).transpose(1, 2))
-
-        # Apply SwiGLU activation
-        swiglu = F.silu(gate_out) * up_out
-
-        # Final projection: (B*S, n_experts, hidden_dim) @ (n_experts, hidden_dim, D)
-        expert_outputs = torch.bmm(swiglu, self.w2.transpose(0, 1).transpose(1, 2))
-
-        # Reshape back and apply dropout
-        expert_outputs = expert_outputs.view(B, S, self.n_experts, D)
-        return self.dropout(expert_outputs)
-
-
-class CollaborativeExpertsModule(nn.Module):
-    """
-    Optimized Mixture of Collaborative Experts (MoC) with significant performance improvements.
+    New simple collaboration (when config.use_simple_collab=True):
+      Two-pass shared-parameter collaboration over the K expert outputs per token, without multihead attention:
+        Inputs per token: selected in R^{K x D}, topk_probs in R^{K}, kept_mask in {0,1}^{K}
+        1) Message pass: M = msg_proj(selected); Q = q_proj(selected); Kk = k_proj(M)
+           scores = Q @ Kk^T / sqrt(D), masked on dropped entries; A = softmax(scores, dim=-1)
+           C = A @ M
+        2) Update MLP: refined = selected + upd([selected, C])
+        3) Fusion: mask dropped entries, renormalize weights over kept positions, and sum.
+      Shapes:
+        selected: [N, K, D]; M, Q, Kk, C, refined: [N, K, D]; scores, A: [N, K, K]; fused: [N, D]
     """
     def __init__(self, config: LunarisCodexConfig):
         super().__init__()
-        self.d_model = config.d_model
-        self.n_experts = config.n_experts
-        self.top_k = config.top_k
+        assert config.n_experts is not None and config.n_experts > 0
+        assert config.top_k >= 1
+        self.n_experts = int(config.n_experts)
+        self.top_k = int(config.top_k)
         self.aux_loss_weight = config.aux_loss_weight
-        self.router_temperature = config.router_temperature
-        self.use_gradient_checkpointing = config.use_gradient_checkpointing
-        self.enable_expert_parallelism = config.enable_expert_parallelism
+        self.capacity_factor = config.capacity_factor
+        self.z_loss_weight = config.router_z_loss_weight
+        self.config = config
 
-        # Choose expert implementation based on parallelism setting
-        if self.enable_expert_parallelism:
-            self.expert_layer = OptimizedExpertLayer(config, self.n_experts)
-        else:
-            # Fallback to individual experts
-            self.experts = nn.ModuleList([
-                FeedForward(config) for _ in range(self.n_experts)
-            ])
+        # Router gate
+        self.gate = nn.Linear(config.d_model, self.n_experts, bias=False)
 
-        # Router with optimized attention
-        self.router_self_attn = nn.MultiheadAttention(
-            embed_dim=self.d_model,
-            num_heads=config.n_heads,
-            dropout=config.dropout,
-            batch_first=True
+        # Experts
+        self.experts = nn.ModuleList([FeedForward(config) for _ in range(self.n_experts)])
+
+        # Legacy collaboration sub-layer: MHA over K selected outputs per token
+        attn_heads = min(max(1, self.top_k), config.n_heads)
+        self.collab_attn = nn.MultiheadAttention(
+            embed_dim=config.d_model, num_heads=attn_heads, dropout=config.dropout, batch_first=True
         )
-        self.router_norm = nn.RMSNorm(self.d_model, eps=1e-5)
-        self.router_gate = nn.Linear(self.d_model, self.n_experts, bias=False)
-
-        # Optimized collaborative fusion
-        self.collab_cross_attn = nn.MultiheadAttention(
-            embed_dim=self.d_model,
-            num_heads=min(config.n_heads, self.top_k),  # Optimize heads for top_k
-            dropout=config.dropout,
-            batch_first=True
-        )
-        self.collab_norm = nn.RMSNorm(self.d_model, eps=1e-5)
-
-        # More efficient collaboration FFN
-        collab_hidden = self.d_model
+        self.collab_norm = nn.RMSNorm(config.d_model, eps=1e-5)
         self.collab_ffn = nn.Sequential(
-            nn.Linear(self.d_model, collab_hidden, bias=False),
-            nn.GELU(),  # GELU is often more efficient than ReLU + Dropout
-            nn.Linear(collab_hidden, self.d_model, bias=False)
+            nn.Linear(config.d_model, config.d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(config.d_model, config.d_model, bias=False),
         )
 
-        # Output projection
-        self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        # Output projection (shared for both paths)
+        self.o_proj = nn.Linear(config.d_model, config.d_model, bias=False)
 
-        # Pre-allocate buffers for efficiency (will be resized as needed)
-        self.register_buffer('_temp_routing_probs', torch.empty(0))
-        self.register_buffer('_temp_expert_usage', torch.empty(0))
+        # New simple collaboration shared-parameter projections and update MLP
+        # Always define to keep state dict stable; used only if use_simple_collab=True.
+        D = config.d_model
+        self.msg_proj = nn.Linear(D, D, bias=False)
+        self.q_proj = nn.Linear(D, D, bias=False)
+        self.k_proj = nn.Linear(D, D, bias=False)
+        self.upd = nn.Sequential(
+            nn.Linear(2 * D, 2 * D, bias=False),
+            nn.GELU(),
+            nn.Dropout(config.simple_collab_dropout),
+            nn.Linear(2 * D, D, bias=False),
+        )
 
-    def _get_expert_outputs(self, x: torch.Tensor) -> torch.Tensor:
-        """Get expert outputs using the most efficient method available."""
-        if self.enable_expert_parallelism:
-            return self.expert_layer(x)
-        else:
-            # Fallback: sequential computation but with reduced memory allocation
-            expert_outputs = []
-            for expert in self.experts:
-                expert_outputs.append(expert(x))
-            return torch.stack(expert_outputs, dim=2)
+        self.save_attn_weights = bool(getattr(config, "save_attn_weights", False))
 
-    def _compute_auxiliary_loss_efficient(
-        self,
-        routing_probs: torch.Tensor,
-        top_k_indices: torch.Tensor,
-        attn_weights: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Efficiently compute auxiliary loss with minimal memory allocation.
-        """
-        # Expert usage balance loss - use pre-allocated buffer
-        expert_usage = routing_probs.mean(dim=(0, 1))  # (n_experts,)
-
-        # Efficient variance computation without creating intermediate tensors
-        mean_usage = expert_usage.mean()
-        balance_loss = ((expert_usage - mean_usage) ** 2).mean()
-
-        # Diversity loss based on cross-attention weights entropy
-        # Calculate entropy of attention weights from collaboration step
-        diversity_loss = -torch.sum(attn_weights * torch.log(attn_weights + 1e-9), dim=-1).mean()
-
-        return 0.01 * diversity_loss + 0.01 * balance_loss
-
-    def _efficient_expert_selection(
-        self,
-        routing_logits: torch.Tensor,
-        expert_outputs: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Efficiently select and weight top-k experts with optimized indexing.
-        """
-        batch_size, seq_len, _ = routing_logits.shape
-
-        # Compute routing probabilities for aux loss (before temperature scaling)
-        routing_probs = F.softmax(routing_logits, dim=-1)
-
-        # Apply temperature scaling
-        scaled_logits = routing_logits / self.router_temperature
-
-        # Top-k selection with efficient indexing
-        top_k_logits, top_k_indices = torch.topk(scaled_logits, self.top_k, dim=-1)
-        top_k_probs = F.softmax(top_k_logits, dim=-1)
-
-        # Efficient gathering using advanced indexing
-        # Create index tensors once
-        batch_idx = torch.arange(batch_size, device=expert_outputs.device)[:, None, None]
-        seq_idx = torch.arange(seq_len, device=expert_outputs.device)[None, :, None]
-
-        # Gather selected expert outputs: (B, S, top_k, d_model)
-        selected_outputs = expert_outputs[batch_idx, seq_idx, top_k_indices]
-
-        return selected_outputs, top_k_probs, routing_probs, top_k_indices
-
-    def _collaborative_fusion_checkpoint(self, selected_outputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Collaborative fusion with optional checkpointing."""
-        def fusion_fn(x):
-            B, S, K, D = x.shape
-            x_flat = x.view(-1, K, D)
-
-            # Cross-attention with residual
-            attn_out, attn_weights = self.collab_cross_attn(x_flat, x_flat, x_flat, need_weights=True)
-            attn_out = self.collab_norm(attn_out + x_flat)
-
-            # FFN refinement with residual
-            refined = self.collab_ffn(attn_out) + attn_out
-            return refined.view(B, S, K, D), attn_weights
-
-        if self.use_gradient_checkpointing and self.training:
-            return checkpoint(fusion_fn, selected_outputs, use_reentrant=False)
-        else:
-            return fusion_fn(selected_outputs)
+    @staticmethod
+    def _load_balance_loss(router_probs: torch.Tensor, hard_assign: torch.Tensor, n_experts: int) -> torch.Tensor:
+        # router_probs: [N, E] float32
+        # hard_assign: [N] long
+        prob_mass = router_probs.mean(dim=0)  # [E]
+        tokens_one_hot = F.one_hot(hard_assign, num_classes=n_experts).to(torch.float32)
+        fraction_tokens = tokens_one_hot.mean(dim=0)  # [E]
+        return (prob_mass * fraction_tokens).sum() * n_experts
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Optimized forward pass with reduced memory allocation and improved efficiency.
-
+        x: [B, T, D]
         Returns:
-            final_output: (B, S, d_model) - The final output after expert collaboration
-            aux_loss: scalar - Auxiliary loss for expert load balancing
-            top_k_indices: (B, S, top_k) - Expert indices selected for each token
+          y: fused output [B, T, D]
+          aux_loss: scalar
+          expert_indices: [B, T, K] per token selected experts (for logging)
         """
-        batch_size, seq_len, d_model = x.shape
+        B, T, D = x.shape
+        N = B * T
+        x_flat = x.view(N, D)
 
-        # Step 1: Parallel expert computation
-        expert_outputs = self._get_expert_outputs(x)  # (B, S, n_experts, d_model)
+        # Router in fp32 for stability
+        logits = self.gate(x_flat.to(torch.float32))  # [N, E]
+        # top-k selection (no gumbel; deterministic and stable)
+        topk_vals, topk_idx = torch.topk(logits, k=self.top_k, dim=-1)  # [N, K]
+        # normalize over the K selected experts to get fusion weights
+        topk_probs = F.softmax(topk_vals, dim=-1, dtype=torch.float32)  # [N, K]
 
-        # Step 2: Router contextualization with memory optimization
-        expert_flat = expert_outputs.view(-1, self.n_experts, d_model)
+        # Auxiliary losses (Switch-style)
+        # For balance loss, use top-1 hard assignments from logits argmax
+        top1 = torch.argmax(logits, dim=-1)  # [N]
+        router_probs = F.softmax(logits, dim=-1, dtype=torch.float32)  # [N, E]
+        balance_loss = self._load_balance_loss(router_probs, top1, self.n_experts)
+        z = torch.logsumexp(logits, dim=-1)  # [N]
+        z_loss = z.pow(2).mean()
+        aux_loss = self.aux_loss_weight * balance_loss + self.z_loss_weight * z_loss
 
-        # Use flash attention if available, otherwise standard attention
+        # Dispatch efficiently to experts using contiguous permutation extended to top-k:
+        # Expand tokens by K, sort by target expert ids, process contiguous segments, and write back.
+        N_K = N * self.top_k
+        # expanded inputs for each token-k pair
+        x_expanded = x_flat.unsqueeze(1).expand(-1, self.top_k, -1).reshape(N_K, D)  # [N*K, D]
+        target_expert = topk_idx.reshape(-1)  # [N*K]
+        # Sort by expert for contiguous segments
+        sorted_expert, sort_idx = torch.sort(target_expert)
+        x_perm = x_expanded.index_select(0, sort_idx)  # [N*K, D]
+        counts = torch.bincount(sorted_expert, minlength=self.n_experts)  # [E]
+
+        # Capacity per expert: scale with factor, based on average N*K / E
+        C = int(math.ceil((N_K / max(1, self.n_experts)) * self.capacity_factor))
+        keep_counts = torch.clamp(counts, max=C)
+
+        # Offsets
+        offsets = torch.cumsum(F.pad(counts, (1, 0)), dim=0)        # [E+1]
+        # We only need kept segments (actual compute)
+        keep_offsets = torch.cumsum(F.pad(keep_counts, (1, 0)), dim=0)  # [E+1]
+
+        # Prepare output buffer for selected expert outputs
+        expert_out_selected = x_expanded.new_zeros((N_K, D))  # [N*K, D]
+        keep_mask = torch.zeros(N_K, dtype=torch.bool, device=x.device)
+
+        # Compute per-expert segments
+        for i in range(self.n_experts):
+            start_all = int(offsets[i].item())
+            cnt = int(counts[i].item())
+            kept = int(keep_counts[i].item())
+            if kept == 0:
+                continue
+            seg = x_perm[start_all:start_all + kept]  # [kept, D]
+            y = self.experts[i](seg)  # [kept, D]
+            idx_slice = sort_idx[start_all:start_all + kept]  # indices into [N*K]
+            expert_out_selected.index_copy_(0, idx_slice, y)
+            keep_mask.index_copy_(0, idx_slice, torch.ones(kept, dtype=torch.bool, device=keep_mask.device))
+
+        # Reshape back to [N, K, D] with zeros where dropped
+        selected = expert_out_selected.view(N, self.top_k, D)  # [N, K, D]
+        kept_mask_nk = keep_mask.view(N, self.top_k)           # [N, K]
+
+        if self.config.use_simple_collab:
+            # -------------------------------
+            # Simple 2-pass collaboration block
+            # -------------------------------
+            # a) Messages and attention over K (per token)
+            # Maintain computation dtype of selected for AMP safety, upcast scores to float32 for stability if needed.
+            dtype = selected.dtype
+            M = self.msg_proj(selected)    # [N, K, D]
+            Q = self.q_proj(selected)      # [N, K, D]
+            Kk = self.k_proj(M)            # [N, K, D]
+
+            # Compute scaled dot-product scores over K
+            # Upcast to float32 for the softmax, then cast back.
+            scores = torch.matmul(Q.to(torch.float32), Kk.to(torch.float32).transpose(1, 2))
+            scores = scores / math.sqrt(D)
+
+            # Mask rows/cols corresponding to dropped expert-token pairs.
+            # Build [N, K, K] mask where an entry is valid only if both row and col are kept.
+            km = kept_mask_nk
+            if km.dtype != torch.bool:
+                km = km.to(torch.bool)
+            row_mask = km.unsqueeze(2)  # [N, K, 1]
+            col_mask = km.unsqueeze(1)  # [N, 1, K]
+            valid_pairs = row_mask & col_mask  # [N, K, K]
+            scores = scores.masked_fill(~valid_pairs, -1e9)
+
+            # Softmax across last dimension (along keys); for rows with no kept cols, softmax over all -1e9 gives NaNs.
+            # Guard by setting rows with all False cols to zero after softmax using the row_mask.
+            A = F.softmax(scores, dim=-1, dtype=torch.float32)  # [N, K, K], float32
+            A = A * valid_pairs.to(A.dtype)
+            denomA = A.sum(dim=-1, keepdim=True).clamp_min(1e-12)  # [N, K, 1]
+            A = (A / denomA).to(dtype)  # back to original dtype
+
+            # C = A @ M
+            C = torch.matmul(A, M)  # [N, K, D]
+
+            # b) Update using shared MLP
+            refined = selected + self.upd(torch.cat([selected, C], dim=-1))  # [N, K, D]
+
+            # c) Mask and fuse using router weights with renormalization over kept positions
+            refined = refined * kept_mask_nk.unsqueeze(-1)  # zero dropped
+            topk_probs_ = topk_probs.to(refined.dtype) * kept_mask_nk.to(topk_probs.dtype)
+            denom = topk_probs_.sum(dim=-1, keepdim=True).clamp_min(1e-12)  # [N, 1]
+            weights = (topk_probs_ / denom).to(refined.dtype)  # [N, K]
+            fused = torch.sum(refined * weights.unsqueeze(-1), dim=1)  # [N, D]
+            fused = self.o_proj(fused).view(B, T, D)
+
+            expert_indices = topk_idx.view(B, T, self.top_k)
+            return fused, aux_loss.to(fused.dtype), expert_indices
+
+        # Legacy collaboration: cross-attention among K expert outputs per token (unchanged)
+        x_collab_in = selected
+        need_w = self.save_attn_weights
         try:
             with torch.backends.cuda.sdp_kernel(enable_flash=True):
-                contextualized_experts, _ = self.router_self_attn(
-                    expert_flat, expert_flat, expert_flat
-                )
-        except:
-            contextualized_experts, _ = self.router_self_attn(
-                expert_flat, expert_flat, expert_flat
-            )
+                attn_out, attn_weights = self.collab_attn(x_collab_in, x_collab_in, x_collab_in, need_weights=need_w)
+        except Exception:
+            out = self.collab_attn(x_collab_in, x_collab_in, x_collab_in, need_weights=need_w)
+            if need_w:
+                attn_out, attn_weights = out
+            else:
+                attn_out = out[0] if isinstance(out, tuple) else out
+                attn_weights = None
 
-        # Apply norm with residual connection
-        contextualized_experts = self.router_norm(contextualized_experts + expert_flat)
+        # Residual + RMSNorm + FFN
+        collab = self.collab_norm(attn_out + x_collab_in)
+        refined = self.collab_ffn(collab) + collab  # [N, K, D]
 
-        # Generate routing scores
-        token_summary = contextualized_experts.mean(dim=1)  # More efficient than multiple operations
-        routing_logits = self.router_gate(token_summary).view(batch_size, seq_len, self.n_experts)
+        # Weighted fusion using top-k probabilities; zero-out dropped pairs
+        topk_probs_ = topk_probs.to(refined.dtype)  # [N, K]
+        refined = refined * kept_mask_nk.unsqueeze(-1)  # mask dropped
+        topk_probs_ = topk_probs_ * kept_mask_nk.to(topk_probs_.dtype)
+        denom = topk_probs_.sum(dim=-1, keepdim=True).clamp_min(1e-12)  # re-normalize if houve drop
+        weights = topk_probs_ / denom
+        fused = torch.sum(refined * weights.unsqueeze(-1), dim=1)  # [N, D]
+        fused = self.o_proj(fused).view(B, T, D)
 
-        # Add router noise during training to improve expert utilization
-        if self.training:
-            noise = torch.randn_like(routing_logits) * 1e-2
-            routing_logits = routing_logits + noise
-
-        # Step 3: Efficient expert selection and weighting
-        selected_outputs, top_k_probs, routing_probs, top_k_indices = self._efficient_expert_selection(
-            routing_logits, expert_outputs
-        )
-
-        # Step 4: Collaborative fusion with optional checkpointing
-        refined_outputs, attn_weights = self._collaborative_fusion_checkpoint(selected_outputs)
-
-        # Step 5: Final weighted combination with in-place operations
-        final_output = torch.sum(refined_outputs * top_k_probs.unsqueeze(-1), dim=2)
-        final_output = self.o_proj(final_output)
-
-        # Step 6: Efficient auxiliary loss computation
-        aux_loss = self._compute_auxiliary_loss_efficient(routing_probs, top_k_indices, attn_weights)
-        aux_loss = aux_loss * self.aux_loss_weight
-
-        return final_output, aux_loss, top_k_indices
+        expert_indices = topk_idx.view(B, T, self.top_k)
+        return fused, aux_loss.to(fused.dtype), expert_indices
 
 
 class Block(nn.Module):
-    """
-    Optimized Transformer block with MoC support.
-    """
     def __init__(self, config: LunarisCodexConfig):
         super().__init__()
         self.attention = Attention(config)
-        # Remove pre-attention norm for QK-Reorder-LN
         self.ffn_norm = nn.RMSNorm(config.d_model, eps=1e-5)
 
-        if config.n_experts is not None and config.n_experts > 0:
-            self.feed_forward = CollaborativeExpertsModule(config)
+        if config.n_experts is not None and config.n_experts > 0 and config.top_k >= 1:
+            self.feed_forward = MoCTopKExperts(config)
             self.is_moe = True
+            print(f"Block initialized with MoC-on-MoE: {config.n_experts} experts, top_k={config.top_k}.")
         else:
             self.feed_forward = FeedForward(config)
             self.is_moe = False
+            print("Block initialized with standard FeedForward network.")
 
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # Attention with residual (QK-Reorder-LN: pass x directly, norms inside Attention)
-        attn_output, new_kv = self.attention(x, freqs_cis, past_kv)
-        h = x + attn_output
+    ) -> Tuple[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        def _inner_forward(
+            x_inner: torch.Tensor,
+            freqs_cis_inner: torch.Tensor,
+            past_kv_inner: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        ):
+            attn_output, new_kv = self.attention(x_inner, freqs_cis_inner, past_kv_inner)
+            h = x_inner + attn_output
 
-        # FFN with residual
-        aux_loss = None
-        expert_indices = None
-        ffn_input = self.ffn_norm(h)
+            aux_loss = None
+            expert_indices = None
+            ffn_input = self.ffn_norm(h)
 
-        if self.is_moe:
-            ffn_output, aux_loss, expert_indices = self.feed_forward(ffn_input)
+            if self.is_moe:
+                ffn_output, aux_loss, expert_indices = self.feed_forward(ffn_input)
+            else:
+                ffn_output = self.feed_forward(ffn_input)
+
+            out = h + ffn_output
+            return out, new_kv, aux_loss, expert_indices
+
+        if self.training:
+            return checkpoint(_inner_forward, x, freqs_cis, past_kv, use_reentrant=False)
         else:
-            ffn_output = self.feed_forward(ffn_input)
-
-        out = h + ffn_output
-        return out, new_kv, aux_loss, expert_indices
+            return _inner_forward(x, freqs_cis, past_kv)
 
 
 class LunarisCodex(nn.Module):
-    """
-    Complete LunarisCodex Language Model with optimized MoC support.
-    """
     def __init__(self, config: LunarisCodexConfig):
         super().__init__()
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.d_model),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
-            ln_f = nn.RMSNorm(config.d_model, eps=1e-5),
-            drop = nn.Dropout(config.dropout),
+            wte=nn.Embedding(config.vocab_size, config.d_model),
+            h=nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
+            ln_f=nn.RMSNorm(config.d_model, eps=1e-5),
+            drop=nn.Dropout(config.dropout),
         ))
 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        # Weight tying
         self.transformer.wte.weight = self.lm_head.weight
 
-        # Precompute rotary embeddings
         freqs_cis = precompute_freqs_cis(
             self.config.d_model // self.config.n_heads,
             self.config.max_seq_len,
@@ -451,27 +446,12 @@ class LunarisCodex(nn.Module):
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
-        # Initialize weights
         self.apply(self._init_weights)
 
-        # Print model info
-        total_params = self.get_num_params()
-        print(f"Number of parameters: {total_params/1e6:.2f}M")
-
-        if config.n_experts is not None:
-            # Calculate active parameters for MoE
-            moe_layers = sum(1 for block in self.transformer.h if hasattr(block, 'is_moe') and block.is_moe)
-            if moe_layers > 0:
-                expert_params_per_layer = sum(p.numel() for p in self.transformer.h[0].feed_forward.expert_layer.parameters() if hasattr(self.transformer.h[0].feed_forward, 'expert_layer'))
-                if expert_params_per_layer == 0:  # Fallback calculation
-                    expert_params_per_layer = sum(p.numel() for p in self.transformer.h[0].feed_forward.experts[0].parameters())
-
-                active_expert_params = expert_params_per_layer * config.top_k * moe_layers
-                other_params = total_params - (expert_params_per_layer * config.n_experts * moe_layers)
-                active_params = other_params + active_expert_params
-
-                print(f"Active parameters per forward pass: {active_params/1e6:.2f}M ({active_params/total_params*100:.1f}% of total)")
-                print(f"MoE efficiency: {config.top_k}/{config.n_experts} experts active per token")
+        num_params = self.get_num_params()
+        print(f"Number of parameters: {num_params/1e6:.2f}M")
+        if config.n_experts is not None and config.n_experts > 0:
+            print("Note: Parameter count includes all experts. Only top_k experts per token are active at runtime.")
 
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -483,12 +463,9 @@ class LunarisCodex(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.Parameter):
-            # For expert parameters in OptimizedExpertLayer
-            torch.nn.init.normal_(module, mean=0.0, std=0.02)
 
-        # Scale output projections
-        if isinstance(module, (Attention, FeedForward, CollaborativeExpertsModule)):
+        # Scale output weights similar to model_moe.py
+        if isinstance(module, (Attention, FeedForward, MoCTopKExperts)):
             for name, p in module.named_parameters():
                 if name.endswith("o_proj.weight") or name.endswith("w2.weight"):
                     torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layers))
@@ -498,117 +475,186 @@ class LunarisCodex(nn.Module):
         idx: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-    ) -> Tuple[torch.Tensor, Optional[Tuple], List[Tuple[torch.Tensor, torch.Tensor]], Optional[List[torch.Tensor]]]:
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[tuple],
+        List[Tuple[torch.Tensor, torch.Tensor]],
+        Optional[List[torch.Tensor]],
+    ]:
         B, T = idx.shape
         start_pos = past_key_values[0][0].shape[-2] if past_key_values is not None else 0
-
         assert start_pos + T <= self.config.max_seq_len, \
             f"Sequence length {start_pos + T} exceeds model's max_seq_len {self.config.max_seq_len}"
 
-        # Token embeddings and dropout
-        x = self.transformer.drop(self.transformer.wte(idx))
-        freqs_cis = self.freqs_cis[start_pos : start_pos + T]
+        x = self.transformer.wte(idx)
+        x = self.transformer.drop(x)
+        freqs_cis = self.freqs_cis[start_pos: start_pos + T].to(dtype=torch.float32, device=x.device)
 
-        # Process through transformer blocks
-        new_past_key_values = []
-        total_aux_loss = 0.0
-        all_expert_indices = []
+        new_past_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        total_aux_loss = x.new_zeros(())
+        expert_indices_list = []
 
         for i, block in enumerate(self.transformer.h):
             past_kv_for_block = past_key_values[i] if past_key_values is not None else None
             x, new_kv, aux_loss, expert_indices = block(x, freqs_cis, past_kv_for_block)
 
             if aux_loss is not None:
-                total_aux_loss = total_aux_loss + aux_loss  # Avoid += for potential in-place issues
+                total_aux_loss = total_aux_loss + aux_loss.to(x.dtype)
 
             if expert_indices is not None:
-                all_expert_indices.append(expert_indices)
+                expert_indices_list.append(expert_indices)
 
             new_past_key_values.append(new_kv)
 
-        # Final layer norm
         x = self.transformer.ln_f(x)
 
-        # Compute loss if targets provided
-        loss_tuple = None
+        loss = None
+        logits = self.lm_head(x) if targets is not None else self.lm_head(x[:, [-1], :])
+
         if targets is not None:
-            logits = self.lm_head(x)
             main_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
-                ignore_index=-1
+                ignore_index=-1,
             )
-
-            # Average auxiliary loss across MoE layers
             num_moe_layers = sum(1 for block in self.transformer.h if getattr(block, 'is_moe', False))
-            final_aux_loss = total_aux_loss / max(num_moe_layers, 1)  # Avoid division by zero
+            final_aux_loss = total_aux_loss
+            if num_moe_layers > 0:
+                final_aux_loss = final_aux_loss / num_moe_layers
 
-            total_loss = main_loss + final_aux_loss
-            loss_tuple = (total_loss, main_loss, final_aux_loss)
+            total_loss = main_loss + final_aux_loss.to(main_loss.dtype)
+            loss = (total_loss, main_loss, final_aux_loss)
+
+            return logits, loss, new_past_key_values, [expert_indices_list]
         else:
-            # Generation mode - only compute logits for last token
-            logits = self.lm_head(x[:, [-1], :])
-
-        # Return expert indices only if we have MoE layers, otherwise None
-        expert_indices_result = all_expert_indices if all_expert_indices else None
-
-        return logits, loss_tuple, new_past_key_values, expert_indices_result
+            return logits, None, new_past_key_values, None
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # Separate parameters for weight decay
-        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        # Separate router gate parameters with a lower LR, keep decay splits
+        router_params, decay_params, nodecay_params = [], [], []
+        router_param_ids = set()
+
+        for n, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if 'feed_forward.gate' in n and isinstance(p, torch.nn.Parameter):
+                router_params.append(p)
+                router_param_ids.add(id(p))
+            elif p.dim() >= 2:
+                decay_params.append(p)
+            else:
+                nodecay_params.append(p)
+
+        # Additionally catch MoCTopKExperts gate path (robust to naming)
+        for n, p in self.named_parameters():
+            if n.endswith('feed_forward.gate.weight'):
+                if id(p) not in router_param_ids:
+                    router_params.append(p)
+                    router_param_ids.add(id(p))
 
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+            {'params': decay_params, 'weight_decay': weight_decay, 'lr': learning_rate},
+            {'params': nodecay_params, 'weight_decay': 0.0, 'lr': learning_rate},
+            {'params': router_params, 'weight_decay': 0.0, 'lr': learning_rate * 0.5},
         ]
 
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {sum(p.numel() for p in decay_params):,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {sum(p.numel() for p in nodecay_params):,} parameters")
+        print(f"num router parameter tensors: {len(router_params)}, with {sum(p.numel() for p in router_params):,} parameters")
 
-        # Use fused AdamW if available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = torch.optim.AdamW(
+            [
+                {'params': decay_params, 'weight_decay': weight_decay},
+                {'params': nodecay_params, 'weight_decay': 0.0},
+                {'params': router_params, 'weight_decay': 0.0, 'lr': learning_rate * 0.5},
+            ],
+            lr=learning_rate,
+            betas=betas,
+            fused=use_fused
+        )
         print(f"using fused AdamW: {use_fused}")
         return optimizer
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Optimized generation with efficient memory usage.
-        """
         self.eval()
         past_key_values = None
-
         for _ in range(max_new_tokens):
-            # Check sequence length
             current_len = past_key_values[0][0].shape[-2] if past_key_values else idx.shape[1]
             if current_len >= self.config.max_seq_len:
                 break
-
-            # Only use last token if we have past_key_values
             idx_cond = idx if past_key_values is None else idx[:, -1:]
-
-            # Forward pass - note the 4 return values
             logits, _, past_key_values, _ = self(idx_cond, past_key_values=past_key_values)
-
-            # Sample next token
-            logits = logits[:, -1, :] / temperature
-
+            logits = logits[:, -1, :] / max(temperature, 1e-5)
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-
+                logits[logits < v[:, [-1]]] = -float('inf')
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
-
         self.train()
         return idx
+
+
+def compile_model_if_available(model: nn.Module):
+    try:
+        model = torch.compile(model, mode="max-autotune")
+        print("Model compiled with torch.compile (max-autotune).")
+    except Exception as e:
+        print(f"torch.compile not enabled or failed: {e}")
+    return model
+
+
+if __name__ == "__main__":
+    # Minimal sanity tests for both collaboration modes.
+    torch.manual_seed(42)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def run_sanity(use_simple: bool):
+        print(f"\nRunning sanity with use_simple_collab={use_simple}")
+        cfg = LunarisCodexConfig(
+            d_model=64,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=4,
+            vocab_size=503,
+            multiple_of=16,
+            ffn_hidden_multiplier=4.0,
+            max_seq_len=64,
+            dropout=0.0,
+            n_experts=4,
+            top_k=2,
+            aux_loss_weight=1e-2,
+            capacity_factor=1.25,
+            router_z_loss_weight=1e-3,
+            use_gradient_checkpointing=False,
+            save_attn_weights=False,
+            use_simple_collab=use_simple,
+            simple_collab_dropout=0.1,
+        )
+        model = LunarisCodex(cfg).to(device)
+        model.train()
+
+        B, T = 2, 8
+        idx = torch.randint(0, cfg.vocab_size, (B, T), device=device)
+        targets = torch.randint(0, cfg.vocab_size, (B, T), device=device)
+
+        logits, loss_tuple, _, expert_info = model(idx, targets=targets)
+        total_loss, ce_loss, aux_loss = loss_tuple
+        print(f"Losses -> total: {total_loss.item():.4f}, ce: {ce_loss.item():.4f}, aux: {aux_loss.item():.6f}")
+        assert logits.shape == (B, T, cfg.vocab_size)
+        assert isinstance(expert_info, list)
+
+        # Check inference/generate
+        model.eval()
+        start = torch.randint(0, cfg.vocab_size, (B, 4), device=device)
+        out = model.generate(start, max_new_tokens=5, temperature=1.0, top_k=20)
+        print("Generate output shape:", out.shape)
+        assert out.shape[1] >= start.shape[1]
+
+    # Run for both modes
+    run_sanity(use_simple=False)
+    run_sanity(use_simple=True)
+    print("\nSanity tests completed.")
