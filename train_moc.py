@@ -1,27 +1,24 @@
 """
-Main Training Script for the LunarisCodex Language Model (MoE Version).
+Main Training Script for the LunarisCodex Language Model (MoC v2: top-k collaborative experts).
 
-This script is adapted to train the Mixture-of-Experts (MoE) version of the model.
-It handles the specific requirements of MoE training, such as the auxiliary load
-balancing loss and logging expert utilization.
+Key engineering features retained:
+- DDP-friendly with no_sync, gradient accumulation, gradient clipping.
+- bfloat16 autocast on H100/GH200; TF32 enabled; fused AdamW with router-specific LR.
+- torch.compile integration with safe fallback.
+- Robust checkpointing/resume; memory-efficient dataloading.
+- W&B logging: total/main/aux losses, perplexity, LR, grad-norm.
+- MoC-specific logging: top-k expert utilization and token-expert pair drop rate.
 
-The training loop is designed to unpack the model's output, which includes the
-total loss, the main cross-entropy loss, and the auxiliary loss. These components
-are logged separately to monitor both model performance and expert load balancing,
-which is a critical aspect of stable MoE training.
-
-Perplexity is calculated using only the main cross-entropy loss to ensure a
-meaningful measure of the model's predictive performance. Additionally, the script
-captures expert routing decisions and logs a utilization bar chart to Weights & Biases
-to provide a clear visualization of how tokens are distributed across experts.
+Usage:
+    python train_moc_v2.py path/to/config.yaml
 """
 
 import os
 import time
 import math
 import glob
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List
 from contextlib import nullcontext
 
 import yaml
@@ -29,14 +26,15 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group, get_rank, get_world_size
+from torch.distributed import init_process_group, destroy_process_group
 from tqdm import tqdm
 
-# Import the MoE-enabled model and configuration from the corresponding model file.
-from model_moc import LunarisCodex, LunarisCodexConfig
+from model_moc import LunarisCodex, LunarisCodexConfig, compile_model_if_available
 
-# The TrainConfig class itself requires no major changes, as the `from_yaml`
-# classmethod will automatically load MoE parameters if they are present in the YAML file.
+# ---------------------------
+# Config
+# ---------------------------
+
 @dataclass
 class TrainConfig:
     model: LunarisCodexConfig = field(default_factory=LunarisCodexConfig)
@@ -56,9 +54,14 @@ class TrainConfig:
     out_dir: str = "checkpoints"
     log_interval: int = 20
     save_interval: int = 1000
-    wandb_project: Optional[str] = "lunaris-codex-moe" # Suggested W&B project for the MoE experiment
+    save_latest_always: bool = True
+    num_workers: int = 4
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 2
+    wandb_project: Optional[str] = "lunaris-codex-moc-v2"
     wandb_entity: Optional[str] = None
-    wandb_run_name: Optional[str] = f"run-moe-{time.strftime('%Y-%m-%d-%H-%M')}"
+    wandb_run_name: Optional[str] = None
 
     @property
     def sequence_length(self):
@@ -68,23 +71,45 @@ class TrainConfig:
     def from_yaml(cls, path: str):
         with open(path, 'r') as f:
             config_dict = yaml.safe_load(f)
+
         model_config_dict = config_dict.pop("model", {})
+        # Ensure top_k is carried through
         model_config = LunarisCodexConfig(**model_config_dict)
+
+        # Backward-compat defaults
+        if model_config.n_experts and getattr(model_config, "aux_loss_weight", None) is None:
+            model_config.aux_loss_weight = 1e-2
+        if getattr(model_config, "capacity_factor", None) is None:
+            model_config.capacity_factor = 1.25
+        if getattr(model_config, "router_z_loss_weight", None) is None:
+            model_config.router_z_loss_weight = 1e-3
+        if getattr(model_config, "top_k", None) is None:
+            model_config.top_k = 2  # default top_k > 1
+
         config_dict['model'] = model_config
+
+        # normalize numeric fields
         float_fields = ['learning_rate', 'weight_decay', 'beta1', 'beta2', 'grad_clip']
-        if 'aux_loss_weight' not in model_config_dict: # Add the default value if it's missing from the yaml
-             model_config.aux_loss_weight = 1e-2
-        int_fields = ['warmup_steps', 'max_steps', 'batch_size', 'gradient_accumulation_steps', 'num_epochs', 'save_interval', 'log_interval']
+        int_fields = ['warmup_steps', 'max_steps', 'batch_size', 'gradient_accumulation_steps',
+                      'num_epochs', 'save_interval', 'log_interval', 'num_workers', 'prefetch_factor']
         for key in float_fields:
             if key in config_dict:
                 config_dict[key] = float(config_dict[key])
         for key in int_fields:
             if key in config_dict:
                 config_dict[key] = int(config_dict[key])
+
         return cls(**config_dict)
 
-# The Dataset and other utility functions remain the same.
+# ---------------------------
+# Dataset
+# ---------------------------
+
 class ShardDataset(Dataset):
+    """
+    Memory-efficient dataset over .npy token shards. Produces (x, y) with length seq_len.
+    Pads last sample with -1 if needed (ignored in CE loss).
+    """
     def __init__(self, data_dir: str, sequence_length: int):
         super().__init__()
         self.data_dir = data_dir
@@ -92,39 +117,48 @@ class ShardDataset(Dataset):
         self.shards = sorted(glob.glob(os.path.join(data_dir, "*.npy")))
         if not self.shards:
             raise ValueError(f"No .npy files found in directory: {data_dir}")
-        total_tokens = sum(np.load(shard, mmap_mode='r').shape[0] for shard in self.shards)
-        self.total_samples = total_tokens // self.sequence_length
-        print(f"[DATA] Loaded {len(self.shards)} shards. Total tokens: {total_tokens/1e9:.2f}B.")
-        print(f"[DATA] Creating {self.total_samples:,} non-overlapping samples of length {self.sequence_length}.")
+        # Lazy memory map shards
         self.mmap_shards = [np.load(shard, mmap_mode='r') for shard in self.shards]
         self.shard_lengths = [len(shard) for shard in self.mmap_shards]
+        total_tokens = sum(self.shard_lengths)
+        self.total_samples = total_tokens // self.sequence_length
         self.cumulative_lengths = np.cumsum(self.shard_lengths)
+        print(f"[DATA] Loaded {len(self.shards)} shards. Total tokens: {total_tokens/1e9:.2f}B.")
+        print(f"[DATA] Creating {self.total_samples:,} non-overlapping samples of length {self.sequence_length}.")
 
     def __len__(self):
         return self.total_samples
 
     def __getitem__(self, idx):
-        token_start_pos = idx * self.sequence_length
+        L = self.sequence_length
+        token_start_pos = idx * L
         shard_idx = np.searchsorted(self.cumulative_lengths, token_start_pos, side='right')
         local_start_idx = token_start_pos if shard_idx == 0 else token_start_pos - self.cumulative_lengths[shard_idx - 1]
-        seq_len_with_target = self.sequence_length + 1
-        if local_start_idx + seq_len_with_target > self.shard_lengths[shard_idx]:
+        seq_len_with_target = L + 1
+
+        if local_start_idx + seq_len_with_target <= self.shard_lengths[shard_idx]:
+            seq = self.mmap_shards[shard_idx][local_start_idx: local_start_idx + seq_len_with_target]
+        else:
             remaining_len = self.shard_lengths[shard_idx] - local_start_idx
-            seq_part1 = self.mmap_shards[shard_idx][local_start_idx : local_start_idx + remaining_len]
+            seq_part1 = self.mmap_shards[shard_idx][local_start_idx: local_start_idx + remaining_len]
+            need = seq_len_with_target - remaining_len
             if shard_idx + 1 < len(self.mmap_shards):
-                needed_from_next = seq_len_with_target - remaining_len
-                seq_part2 = self.mmap_shards[shard_idx + 1][:needed_from_next]
+                seq_part2 = self.mmap_shards[shard_idx + 1][:need]
                 seq = np.concatenate((seq_part1, seq_part2))
             else:
                 seq = seq_part1
-        else:
-            seq = self.mmap_shards[shard_idx][local_start_idx : local_start_idx + seq_len_with_target]
+
         if len(seq) < seq_len_with_target:
             pad_len = seq_len_with_target - len(seq)
             seq = np.pad(seq, (0, pad_len), 'constant', constant_values=-1)
+
         seq_tensor = torch.from_numpy(seq.astype(np.int64))
         x, y = seq_tensor[:-1], seq_tensor[1:]
         return x, y
+
+# ---------------------------
+# DDP / utils
+# ---------------------------
 
 def setup_ddp():
     is_ddp = 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1
@@ -134,16 +168,16 @@ def setup_ddp():
         local_rank = int(os.environ['LOCAL_RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
         torch.cuda.set_device(local_rank)
-        print(f"[DDP] Setup complete: rank {rank}, world_size {world_size}")
-        return True, rank, world_size
-    return False, 0, 1
+        print(f"[DDP] Setup complete: rank {rank}, world_size {world_size}, local_rank {local_rank}")
+        return True, rank, world_size, local_rank
+    return False, 0, 1, 0
 
 def get_lr(step, config: TrainConfig):
     if step < config.warmup_steps:
-        return config.learning_rate * step / config.warmup_steps
+        return config.learning_rate * step / max(1, config.warmup_steps)
     if step >= config.max_steps:
         return config.learning_rate * 0.01
-    decay_ratio = (step - config.warmup_steps) / (config.max_steps - config.warmup_steps)
+    decay_ratio = (step - config.warmup_steps) / max(1, (config.max_steps - config.warmup_steps))
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return (config.learning_rate * 0.01) + coeff * (config.learning_rate * 0.99)
 
@@ -159,309 +193,254 @@ def unwrap_model_keys(state_dict):
         unwrapped[new_k] = v
     return unwrapped
 
+# ---------------------------
+# Training
+# ---------------------------
+
 def train(config_path: str):
     config = TrainConfig.from_yaml(config_path)
-    is_ddp, rank, world_size = setup_ddp()
-    is_master_process = rank == 0
+    is_ddp, rank, world_size, local_rank = setup_ddp()
+    is_master = (rank == 0)
 
+    # Seeds and perf knobs
     torch.manual_seed(1337 + rank)
+    np.random.seed(1337 + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+
     device_type = 'cuda' if 'cuda' in config.device else 'cpu'
-    ctx = torch.amp.autocast(device_type=device_type, dtype=dtype)
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=amp_dtype) if device_type == 'cuda' else nullcontext()
 
-    if is_master_process:
+    # Logging header
+    if is_master:
         os.makedirs(config.out_dir, exist_ok=True)
+        if config.wandb_run_name is None:
+            config.wandb_run_name = f"run-mocv2-{time.strftime('%Y-%m-%d-%H-%M')}"
+        print("-" * 60)
+        print(" LUNARIS CODEX - MoC v2 (top-k collaborative experts) Training")
+        print("-" * 60)
+        print(f"Model: {config.model}")
+        if config.model.n_experts:
+            print(f"MoC: experts={config.model.n_experts}, top_k={config.model.top_k}, "
+                  f"cap_factor={config.model.capacity_factor}, aux={config.model.aux_loss_weight}, "
+                  f"z={config.model.router_z_loss_weight}")
+        print(f"Data: {config.data_dir}, SeqLen={config.sequence_length}, Device={config.device}, bf16={use_bf16}")
+        print(f"Batch={config.batch_size}, Accum={config.gradient_accumulation_steps}, LR={config.learning_rate}")
+        print("-" * 60)
 
-    if is_master_process and config.wandb_project:
+    # W&B
+    if is_master and config.wandb_project:
         import wandb
-        wandb.init(project=config.wandb_project, entity=config.wandb_entity, name=config.wandb_run_name, config=config.__dict__)
+        wandb.init(project=config.wandb_project, entity=config.wandb_entity,
+                   name=config.wandb_run_name, config=asdict(config))
 
+    # Data
     train_dataset = ShardDataset(data_dir=config.data_dir, sequence_length=config.sequence_length)
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True) if is_ddp else None
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, sampler=train_sampler, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        sampler=train_sampler,
+        shuffle=(train_sampler is None),
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory,
+        persistent_workers=(config.num_workers > 0 and config.persistent_workers),
+        prefetch_factor=(config.prefetch_factor if config.num_workers > 0 else None),
+        drop_last=True,
+    )
 
-    model = LunarisCodex(config.model).to(config.device)
+    # Model
+    model = LunarisCodex(config.model).to(config.device, dtype=torch.bfloat16 if use_bf16 else torch.float32)
 
-    if config.compile_model:
-        if is_master_process: print("[MODEL] Compiling model...")
-        model = torch.compile(model)
+    # Optional compile
+    if config.compile_model and device_type == 'cuda':
+        if is_master: print("[MODEL] Compiling with torch.compile ...")
+        try:
+            model = compile_model_if_available(model)
+        except Exception as e:
+            if is_master: print(f"[WARN] torch.compile failed, continuing without compile: {e}")
+
+    # DDP
     if is_ddp:
-        model = DDP(model, device_ids=[int(os.environ['LOCAL_RANK'])])
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     raw_model = model.module if is_ddp else model
-    # --- Start of Parameter Breakdown Logic ---
-    if is_master_process:
-        total_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
-        backbone_params = 0
-        expert_params = 0
 
-        for name, p in raw_model.named_parameters():
-            if p.requires_grad:
-                if 'expert' in name.lower():  # More flexible expert parameter detection
-                    expert_params += p.numel()
-                else:
-                    backbone_params += p.numel()
-
-        params_per_expert = 0
-        num_moe_layers = 0
-        first_moe_block = None
-
-        for block in raw_model.transformer.h:
-            if getattr(block, 'is_moe', False):
-                num_moe_layers += 1
-                if first_moe_block is None:
-                    first_moe_block = block
-
-        if first_moe_block and hasattr(first_moe_block.feed_forward, 'expert_layer'):
-            # For optimized expert layer
-            for p in first_moe_block.feed_forward.expert_layer.parameters():
-                if p.requires_grad:
-                    params_per_expert += p.numel()
-            params_per_expert = params_per_expert // config.model.n_experts  # Divide by number of experts
-        elif first_moe_block and hasattr(first_moe_block.feed_forward, 'experts'):
-            # For individual experts fallback
-            for p in first_moe_block.feed_forward.experts[0].parameters():
-                if p.requires_grad:
-                    params_per_expert += p.numel()
-
-        active_params = backbone_params + (num_moe_layers * params_per_expert * config.model.top_k)
-    # --- End of Parameter Breakdown Logic ---
-
-    # --- Start of New Logging Block ---
-    if is_master_process:
-        print("\n" + "="*80)
-        print(" " * 25 + "LUNARIS CODEX MoC TRAINING")
-        print("="*80)
-
-        print("\n" + "-"*30 + " MODEL & ARCHITECTURE " + "-"*26)
-        print(f"{'Total Trainable Parameters:':<35} {total_params/1e6:<8.2f}M")
-        if config.model.n_experts and config.model.n_experts > 0:
-            print(f"{'Backbone Parameters:':<35} {backbone_params/1e6:<8.2f}M")
-            print(f"{'Parameters per Expert:':<35} {params_per_expert/1e6:<8.2f}M")
-            print(f"{'Total Expert Parameters:':<35} {expert_params/1e6:<8.2f}M ({config.model.n_experts} experts x {num_moe_layers} layers)")
-            print(f"{'Active Parameters per Pass:':<35} {active_params/1e6:<8.2f}M")
-            print(f"{'MoC Configuration:':<35} {config.model.top_k}/{config.model.n_experts} collaborative experts per token")
-
-        print("\n" + "-"*36 + " DATA " + "-"*38)
-        print(f"{'Dataset Path:':<35} {config.data_dir}")
-        print(f"{'Sequence Length:':<35} {config.sequence_length}")
-
-        print("\n" + "-"*34 + " TRAINING " + "-"*36)
-        print(f"{'Device:':<35} {config.device}")
-        print(f"{'Precision:':<35} {dtype}")
-        print(f"{'Max Steps:':<35} {config.max_steps:,}")
-        print(f"{'Batch Size (per device):':<35} {config.batch_size}")
-        print(f"{'Gradient Accumulation Steps:':<35} {config.gradient_accumulation_steps}")
-        print(f"{'Auxiliary Loss Weight:':<35} {config.model.aux_loss_weight}")
-
-        if is_ddp:
-            print("\n" + "-"*29 + " DISTRIBUTED SETUP " + "-"*28)
-            print(f"{'Backend:':<35} DDP")
-            print(f"{'World Size:':<35} {world_size}")
-
-        print("="*80 + "\n")
-    # --- End of New Logging Block ---
+    # Optimizer
     optimizer = raw_model.configure_optimizers(
         weight_decay=config.weight_decay,
         learning_rate=config.learning_rate,
         betas=(config.beta1, config.beta2),
-        device_type=device_type
+        device_type=device_type,
     )
 
+    # Resume
     current_step, current_epoch = 0, 0
-    checkpoint_path = os.path.join(config.out_dir, "latest_checkpoint.pt")
-    if os.path.exists(checkpoint_path):
-        if is_master_process: print(f"[SETUP] Resuming from checkpoint: {checkpoint_path}")
-        state = torch.load(checkpoint_path, map_location=config.device)
-        raw_model.load_state_dict(unwrap_model_keys(state['model']))
+    latest_path = os.path.join(config.out_dir, "latest_checkpoint.pt")
+    if os.path.exists(latest_path):
+        if is_master: print(f"[RESUME] Loading checkpoint: {latest_path}")
+        state = torch.load(latest_path, map_location=config.device)
+        raw_model.load_state_dict(unwrap_model_keys(state['model']), strict=True)
         optimizer.load_state_dict(state['optimizer'])
-        current_step = state['step']
-        current_epoch = state.get('epoch', 0)
+        current_step = int(state.get('step', 0))
+        current_epoch = int(state.get('epoch', 0))
 
     optimizer.zero_grad(set_to_none=True)
     if is_ddp:
+        assert train_sampler is not None
         train_sampler.set_epoch(current_epoch)
 
-    if is_master_process:
-        print(f"\n[TRAIN] Starting training from step {current_step} up to {config.max_steps} steps...")
-        pbar = tqdm(total=config.max_steps, desc="Training Steps", initial=current_step, ncols=120)
+    if is_master:
+        print(f"\n[TRAIN] Starting at step {current_step} up to {config.max_steps} ...")
+        pbar = tqdm(total=config.max_steps, desc="Steps", initial=current_step, ncols=120)
 
+    # Training loop
     data_iter = iter(train_loader)
     while current_step < config.max_steps:
         current_step += 1
+        # LR schedule
         lr = get_lr(current_step, config)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        for pg in optimizer.param_groups:
+            pg['lr'] = lr
 
-        # Initialize accumulators for the different loss components.
-        # This is necessary for accurate logging across gradient accumulation steps.
-        accumulated_loss = 0.0
-        accumulated_main_loss = 0.0
-        accumulated_aux_loss = 0.0
-        expert_indices_list = None # Ensure the variable exists outside the loop.
+        # Accumulators for logging
+        accum_total = 0.0
+        accum_main = 0.0
+        accum_aux = 0.0
+        # For expert routing logs (first MoC layer)
+        first_layer_expert_indices = None  # [B, T, K]
 
-        for micro_step in range(config.gradient_accumulation_steps):
-            is_last_micro_step = (micro_step == config.gradient_accumulation_steps - 1)
-            # When using DDP with gradient accumulation, we only want to sync gradients
-            # on the final micro-step. `model.no_sync()` prevents DDP from reducing
-            # gradients across processes on all but the last micro-step.
-            ddp_context = model.no_sync() if is_ddp and not is_last_micro_step else nullcontext()
+        for micro in range(config.gradient_accumulation_steps):
+            is_last_micro = (micro == config.gradient_accumulation_steps - 1)
+            ddp_context = model.no_sync() if is_ddp and not is_last_micro else nullcontext()
 
             with ddp_context:
                 try:
                     x, y = next(data_iter)
                 except StopIteration:
                     current_epoch += 1
-                    if is_ddp: train_loader.sampler.set_epoch(current_epoch)
+                    if is_ddp:
+                        train_sampler.set_epoch(current_epoch)
                     data_iter = iter(train_loader)
                     x, y = next(data_iter)
 
-                x, y = x.to(config.device, non_blocking=True), y.to(config.device, non_blocking=True)
+                x = x.to(config.device, non_blocking=True)
+                y = y.to(config.device, non_blocking=True)
 
-                with ctx:
-                    # The MoC model returns 4 values: (logits, loss_tuple, past_kv, expert_indices)
-                    # We unpack it here. The loss_tuple is (total_loss, main_loss, aux_loss) when targets are provided.
-                    logits, loss_tuple, _, expert_indices_list = model(x, targets=y, past_key_values=None)
-                    
-                    # Handle the case where loss_tuple might be None (shouldn't happen with targets, but safety first)
-                    if loss_tuple is not None:
-                        loss, main_loss, aux_loss = loss_tuple
-                        # Scale the loss to account for gradient accumulation.
-                        loss = loss / config.gradient_accumulation_steps
-                    else:
-                        # This should not happen when targets are provided, but handle gracefully
-                        raise ValueError("Expected loss_tuple to be provided when targets are given")
+                with autocast_ctx:
+                    logits, loss_tuple, _, aux_list = model(x, targets=y, past_key_values=None)
+                    # loss_tuple = (total, main, aux)
+                    total_loss, main_loss, aux_loss = loss_tuple
+                    # Scale for gradient accumulation
+                    total_loss = total_loss / config.gradient_accumulation_steps
 
-                # Accumulate each loss component separately for accurate logging.
-                accumulated_loss += loss.item()
+                # Accumulate for logs (use .item() after scaling)
+                accum_total += float(total_loss.item())
                 if main_loss is not None:
-                    # The main_loss is the raw cross-entropy loss for this micro-batch.
-                    # We scale it by the number of accumulation steps before adding it to the accumulator.
-                    accumulated_main_loss += main_loss.item() / config.gradient_accumulation_steps
+                    accum_main += float(main_loss.item()) / config.gradient_accumulation_steps
                 if aux_loss is not None:
-                    # The same applies to the auxiliary loss.
-                    accumulated_aux_loss += aux_loss.item() / config.gradient_accumulation_steps
+                    accum_aux += float(aux_loss.item()) / config.gradient_accumulation_steps
 
-                loss.backward()
+                # Capture first MoC layer routing indices when available
+                # model_moc_v2 returns aux_list = [expert_indices_list] (no keep_mask returned)
+                if aux_list is not None and isinstance(aux_list, list) and len(aux_list) == 1:
+                    indices_list = aux_list[0]
+                    if indices_list and first_layer_expert_indices is None:
+                        first_layer_expert_indices = indices_list[0].detach()  # [B, T, K]
 
+                total_loss.backward()
+
+        # Clip and step
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        if is_master_process:
+        # Logging
+        if is_master:
             pbar.update(1)
             if current_step % config.log_interval == 0:
-                # Perplexity is calculated only from the main cross-entropy loss, as the
-                # auxiliary loss is for regularization and not a measure of predictive performance.
-                log_loss_main = accumulated_main_loss
-                try:
-                    perplexity = math.exp(log_loss_main)
-                except (OverflowError, ValueError):
-                    perplexity = float('inf')
-
-                # Log the separate loss components to the progress bar for real-time monitoring.
-                postfix_data = {
-                    "loss": f"{accumulated_loss:.3f}",
-                    "loss_main": f"{log_loss_main:.3f}",
-                    "loss_aux": f"{accumulated_aux_loss:.4f}",
-                    "ppl": f"{perplexity:.2f}",
+                ppl = math.exp(accum_main) if accum_main < 20 else float('inf')
+                pbar.set_postfix({
+                    "loss": f"{accum_total:.3f}",
+                    "main": f"{accum_main:.3f}",
+                    "aux": f"{accum_aux:.4f}",
+                    "ppl": f"{ppl:.2f}",
                     "lr": f"{lr:.2e}",
-                    "gnorm": f"{grad_norm.item():.2f}"
-                }
-                pbar.set_postfix(postfix_data)
+                    "gnorm": f"{float(grad_norm):.2f}",
+                })
 
                 if config.wandb_project:
-                    # Create a single dictionary for all W&B logs for this step.
+                    import wandb
                     log_data = {
                         "step": current_step,
                         "epoch": current_epoch,
-                        "loss/total": accumulated_loss,
-                        "loss/main": log_loss_main,
-                        "loss/aux": accumulated_aux_loss,
-                        "perplexity": perplexity,
+                        "loss/total": accum_total,
+                        "loss/main": accum_main,
+                        "loss/aux": accum_aux,
+                        "perplexity": ppl,
                         "lr": lr,
-                        "grad_norm": grad_norm.item(),
+                        "grad_norm": float(grad_norm),
                     }
 
-                    # Check if expert routing data is available for logging.
-                    if expert_indices_list and len(expert_indices_list) > 0:
-                        # For visualization, we'll focus on the expert choices in the first MoE layer.
-                        first_moe_layer_indices = expert_indices_list[0].detach().cpu()
+                    # Expert utilization (top-k): flatten [B, T, K] -> [B*T*K] before bincount
+                    if first_layer_expert_indices is not None:
+                        num_experts = int(raw_model.config.n_experts or 0)
+                        if num_experts > 0:
+                            flat_idx = first_layer_expert_indices.reshape(-1)  # [B*T*K]
+                            counts = torch.bincount(flat_idx, minlength=num_experts)
+                            total_pairs = counts.sum().clamp_min(1)
+                            util = counts.float() / total_pairs
+                            # per-expert utilization
+                            for i in range(num_experts):
+                                log_data[f"experts/util_layer0/e{i}"] = util[i].item()
 
-                        # Count the number of tokens routed to each expert.
-                        num_experts = raw_model.config.n_experts
-                        expert_counts = torch.bincount(first_moe_layer_indices.view(-1), minlength=num_experts)
-                        total_tokens = expert_counts.sum().item()
+                            # Token-expert pair drop rate (approximated via capacity factor)
+                            # Compute capacity per expert for this batch:
+                            # N_pairs = B*T*K; C = ceil((N_pairs / E) * capacity_factor)
+                            # dropped_pairs_e = max(0, counts[e] - C)
+                            # drop_rate = sum(dropped_pairs_e) / N_pairs
+                            E = num_experts
+                            Bsz, Tlen, K = first_layer_expert_indices.shape
+                            N_pairs = (Bsz * Tlen * K)
+                            C = int(math.ceil((N_pairs / max(1, E)) * raw_model.config.capacity_factor))
+                            dropped = (counts - C).clamp_min(0)
+                            drop_rate = dropped.sum().float() / float(max(1, N_pairs))
+                            log_data["experts/drop_rate_layer0"] = drop_rate.item()
 
-                        # Calculate utilization percentages and balance metrics
-                        expert_percentages = (expert_counts.float() / total_tokens * 100).tolist()
-                        
-                        # Calculate load balance - how evenly distributed the tokens are
-                        ideal_percentage = 100.0 / num_experts
-                        balance_variance = sum((pct - ideal_percentage) ** 2 for pct in expert_percentages) / num_experts
-                        balance_score = max(0, 100 - balance_variance)  # Higher is better
-                        
-                        # Log individual expert utilization percentages
-                        for i, pct in enumerate(expert_percentages):
-                            log_data[f"expert_util/expert_{i}_pct"] = pct
-                        
-                        # Log balance metrics
-                        log_data["expert_util/balance_score"] = balance_score
-                        log_data["expert_util/balance_variance"] = balance_variance
-                        log_data["expert_util/max_utilization"] = max(expert_percentages)
-                        log_data["expert_util/min_utilization"] = min(expert_percentages)
-
-                        # Create a wandb.Table to be plotted as a bar chart.
-                        table = wandb.Table(columns=["Expert ID", "Token Count", "Percentage"])
-                        for i in range(num_experts):
-                            table.add_data(f"Expert {i}", expert_counts[i].item(), expert_percentages[i])
-
-                        # Add the bar chart plot to our logging dictionary.
-                        log_data["expert_utilization/layer_0"] = wandb.plot.bar(
-                            table, "Expert ID", "Token Count", 
-                            title=f"Expert Utilization (Layer 0) - Balance Score: {balance_score:.1f}"
-                        )
-
-                        # Also create percentage bar chart
-                        pct_table = wandb.Table(columns=["Expert ID", "Percentage"])
-                        for i in range(num_experts):
-                            pct_table.add_data(f"Expert {i}", expert_percentages[i])
-                        
-                        log_data["expert_utilization/layer_0_percentage"] = wandb.plot.bar(
-                            pct_table, "Expert ID", "Percentage",
-                            title=f"Expert Utilization % (Layer 0) - Ideal: {ideal_percentage:.1f}%"
-                        )
-
-                    # Log all metrics for this step to W&B at once.
                     wandb.log(log_data)
 
-            if current_step > 0 and current_step % config.save_interval == 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'config': config.__dict__,
-                    'step': current_step,
-                    'epoch': current_epoch,
-                }
-                save_path = os.path.join(config.out_dir, f"ckpt_{current_step}.pt")
-                torch.save(checkpoint, save_path)
+        # Checkpointing
+        if is_master and current_step % config.save_interval == 0:
+            ckpt = {
+                'model': (raw_model.state_dict()),
+                'optimizer': optimizer.state_dict(),
+                'config': asdict(config),
+                'step': current_step,
+                'epoch': current_epoch,
+            }
+            save_path = os.path.join(config.out_dir, f"ckpt_{current_step}.pt")
+            torch.save(ckpt, save_path)
+            if config.save_latest_always:
                 latest_path = os.path.join(config.out_dir, "latest_checkpoint.pt")
-                torch.save(checkpoint, latest_path)
-                print(f"\n[CHECKPOINT] Saved checkpoint to {save_path}")
+                torch.save(ckpt, latest_path)
+            print(f"\n[CKPT] Saved checkpoint: {save_path}")
 
-    if is_master_process:
-        print("\nMax steps reached. Finishing training.")
+    # Finalize
+    if is_master:
+        print("\n[TRAIN] Max steps reached. Finishing.")
         pbar.close()
         if config.wandb_project:
+            import wandb
             wandb.finish()
     if is_ddp:
         destroy_process_group()
 
+
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description="Train a LunarisCodex-MoC model.")
-    parser.add_argument("config", type=str, help="Path to the MoC config.yaml file.")
+    parser = argparse.ArgumentParser(description="Train a LunarisCodex MoC v2 model (top-k collaborative experts).")
+    parser.add_argument("config", type=str, help="Path to the config.yaml file.")
     args = parser.parse_args()
     train(args.config)
