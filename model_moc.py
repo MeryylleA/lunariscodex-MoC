@@ -332,6 +332,7 @@ class MoCTopKExperts(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: LunarisCodexConfig):
         super().__init__()
+        self.config = config
         self.attention = Attention(config)
         self.ffn_norm = nn.RMSNorm(config.d_model, eps=1e-5)
         if config.n_experts is not None and config.n_experts > 0 and config.top_k >= 1:
