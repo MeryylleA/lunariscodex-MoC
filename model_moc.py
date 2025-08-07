@@ -1,4 +1,3 @@
-# model_moc.py
 import math
 import inspect
 from dataclasses import dataclass
@@ -34,6 +33,9 @@ class LunarisCodexConfig:
     aux_loss_weight: float = 1e-2
     capacity_factor: float = 1.25
     router_z_loss_weight: float = 1e-3
+    # Added: exploration/noise and overflow penalty
+    router_noise_std: float = 0.0          # training-time router noise; e.g., 0.01–0.1
+    drop_penalty_weight: float = 1e-3      # penalize overflow drops
     # Engineering
     use_gradient_checkpointing: bool = True  # safe default for single-GPU
     grad_ckpt_policy: str = "ffn"           # "none" | "ffn" | "block"
@@ -112,7 +114,8 @@ class Attention(nn.Module):
             n_repeats = self.n_heads // self.n_kv_heads
             k = k.repeat_interleave(n_repeats, dim=1)
             v = v.repeat_interleave(n_repeats, dim=1)
-        is_causal = past_kv is None
+        # Always causal for autoregressive decoding (safe with KV cache and chunked decode)
+        is_causal = True
         # Prefer Flash SDP kernel
         with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
             y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)  # [B, H, T, D]
@@ -132,7 +135,7 @@ class ReasoningFeedForward(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         # IRL steps and residual scaling for stability
         self.n_reasoning_steps = int(getattr(config, "n_reasoning_steps", 1))
-        self.alpha = 1.0 / math.sqrt(max(1, self.n_reasoning_steps))
+        self.alpha = 1.0 / math.sqrt(max(1, self.n_reasoning_steps))  # keep; init fix removes extra scaling
 
     def _ffn_logic(self, z: torch.Tensor) -> torch.Tensor:
         gate, up = self.w13(z).chunk(2, dim=-1)
@@ -192,12 +195,17 @@ class MoCTopKExperts(nn.Module):
         self.save_attn_weights = bool(getattr(config, "save_attn_weights", False))
 
     @staticmethod
-    def _load_balance_loss(router_probs: torch.Tensor, hard_assign: torch.Tensor, n_experts: int) -> torch.Tensor:
+    def _load_balance_loss_topk(
+        router_probs: torch.Tensor, topk_idx: torch.Tensor, topk_probs: torch.Tensor, n_experts: int
+    ) -> torch.Tensor:
         # router_probs: [N, E] float32
-        # hard_assign: [N] long
+        # topk_idx/topk_probs: [N, K]
+        N, E = router_probs.shape
+        assign = router_probs.new_zeros(N, E)  # expected assignment mass per expert
+        for j in range(topk_idx.size(1)):
+            assign.scatter_add_(1, topk_idx[:, j:j+1], topk_probs[:, j:j+1])
+        fraction_tokens = assign.mean(dim=0)  # [E]
         prob_mass = router_probs.mean(dim=0)  # [E]
-        tokens_one_hot = F.one_hot(hard_assign, num_classes=n_experts).to(torch.float32)
-        fraction_tokens = tokens_one_hot.mean(dim=0)  # [E]
         return (prob_mass * fraction_tokens).sum() * n_experts
 
     def _capacity_limit(self, total_slots: int) -> int:
@@ -220,56 +228,67 @@ class MoCTopKExperts(nn.Module):
         N = B * T
         x_flat = x.view(N, D)
 
-        # Router in fp32 for stability
+        # Router in fp32 for stability (+ optional noise for exploration)
         logits = self.gate(x_flat.to(torch.float32))  # [N, E]
+        if self.training and getattr(self.config, "router_noise_std", 0.0) > 0.0:
+            logits = logits + torch.randn_like(logits) * float(self.config.router_noise_std)
+
         # top-k selection
         topk_vals, topk_idx = torch.topk(logits, k=self.top_k, dim=-1)  # [N, K]
         # Normalize over K for fusion weights (compute in fp32)
         topk_probs = F.softmax(topk_vals, dim=-1, dtype=torch.float32)  # [N, K]
 
-        # Aux losses
-        top1 = torch.argmax(logits, dim=-1)  # [N]
+        # Aux losses (top-k-aware load balance + z-loss)
         router_probs = F.softmax(logits, dim=-1, dtype=torch.float32)  # [N, E]
-        balance_loss = self._load_balance_loss(router_probs, top1, self.n_experts)
+        balance_loss = self._load_balance_loss_topk(router_probs, topk_idx, topk_probs, self.n_experts)
         z = torch.logsumexp(logits, dim=-1)
         z_loss = (z * z).mean()
         aux_loss = self.aux_loss_weight * balance_loss + self.z_loss_weight * z_loss
 
-        # Dispatch: expand by K and permute by expert id
+        # Dispatch: expand by K
         N_K = N * self.top_k
         x_expanded = x_flat.unsqueeze(1).expand(-1, self.top_k, -1).reshape(N_K, D)  # [N*K, D]
         target_expert = topk_idx.reshape(-1)  # [N*K]
-        sorted_expert, sort_idx = torch.sort(target_expert)
-        x_perm = x_expanded.index_select(0, sort_idx)  # [N*K, D]
-        counts = torch.bincount(sorted_expert, minlength=self.n_experts)  # [E]
+        prio = topk_vals.reshape(-1)          # [N*K]
 
         # Capacity per expert (power-of-two aligned for kernel friendliness)
         C = self._capacity_limit(N_K)
-        keep_counts = torch.clamp(counts, max=C)
-
-        # Offsets for full and kept segments
-        offsets = torch.cumsum(F.pad(counts, (1, 0)), dim=0)          # [E+1]
-        keep_offsets = torch.cumsum(F.pad(keep_counts, (1, 0)), dim=0)  # [E+1]
 
         # Output buffer for selected expert outputs
         expert_out_selected = x_expanded.new_zeros((N_K, D))  # [N*K, D]
         keep_mask = torch.zeros(N_K, dtype=torch.bool, device=x.device)
+        total_dropped = 0
 
-        # Compute per-expert segments (contiguous)
-        for i in range(self.n_experts):
-            start_all = int(offsets[i].item())
-            kept = int(keep_counts[i].item())
-            if kept == 0:
+        # Per-expert segmented top-k by router score (prio), capacity-limited
+        for e in range(self.n_experts):
+            idx_e = (target_expert == e).nonzero(as_tuple=False).squeeze(-1)  # indices into [N*K]
+            n_e = idx_e.numel()
+            if n_e == 0:
                 continue
-            seg = x_perm[start_all:start_all + kept]  # [kept, D], contiguous
-            y = self.experts[i](seg)  # [kept, D]
-            idx_slice = sort_idx[start_all:start_all + kept]  # indices into [N*K]
-            expert_out_selected.index_copy_(0, idx_slice, y)
-            keep_mask.index_copy_(0, idx_slice, torch.ones(kept, dtype=torch.bool, device=keep_mask.device))
+            if C <= 0:
+                total_dropped += n_e
+                continue
+            if n_e <= C:
+                kept_idx = idx_e
+            else:
+                prio_e = prio.index_select(0, idx_e)
+                _, local_top = torch.topk(prio_e, k=C, largest=True, sorted=False)
+                kept_idx = idx_e.index_select(0, local_top)
+                total_dropped += int(n_e - C)
+
+            seg = x_expanded.index_select(0, kept_idx)  # [kept, D]
+            y = self.experts[e](seg)                    # [kept, D]
+            expert_out_selected.index_copy_(0, kept_idx, y)
+            keep_mask.index_fill_(0, kept_idx, True)
 
         # Reshape back to [N, K, D] with zeros where dropped
-        selected = expert_out_selected.view(N, self.top_k, D)  # [N, K, D]
-        kept_mask_nk = keep_mask.view(N, self.top_k)           # [N, K]
+        selected = expert_out_selected.view(N, self.top_k, D)   # [N, K, D]
+        kept_mask_nk = keep_mask.view(N, self.top_k)            # [N, K]
+
+        # Penalize drops explicitly
+        if N_K > 0 and self.config.drop_penalty_weight > 0:
+            drop_frac = 1.0 - keep_mask.to(torch.float32).mean()
+            aux_loss = aux_loss + self.config.drop_penalty_weight * drop_frac
 
         if self.config.use_simple_collab:
             # Simple 2-pass collaboration block
@@ -295,14 +314,12 @@ class MoCTopKExperts(nn.Module):
                 s11 = scores[:, 1, 1]
                 k0 = km[:, 0]
                 k1 = km[:, 1]
-                neg_inf = torch.finfo(scores.dtype).min
-                # Row 0
-                r0c0 = torch.where(k0 & k0, s00, torch.tensor(neg_inf, dtype=scores.dtype, device=scores.device))
-                r0c1 = torch.where(k0 & k1, s01, torch.tensor(neg_inf, dtype=scores.dtype, device=scores.device))
+                neg_min = torch.finfo(scores.dtype).min
+                r0c0 = torch.where(k0 & k0, s00, torch.tensor(neg_min, dtype=scores.dtype, device=scores.device))
+                r0c1 = torch.where(k0 & k1, s01, torch.tensor(neg_min, dtype=scores.dtype, device=scores.device))
+                r1c0 = torch.where(k1 & k0, s10, torch.tensor(neg_min, dtype=scores.dtype, device=scores.device))
+                r1c1 = torch.where(k1 & k1, s11, torch.tensor(neg_min, dtype=scores.dtype, device=scores.device))
                 r0 = torch.stack([r0c0, r0c1], dim=-1)
-                # Row 1
-                r1c0 = torch.where(k1 & k0, s10, torch.tensor(neg_inf, dtype=scores.dtype, device=scores.device))
-                r1c1 = torch.where(k1 & k1, s11, torch.tensor(neg_inf, dtype=scores.dtype, device=scores.device))
                 r1 = torch.stack([r1c0, r1c1], dim=-1)
                 rows = torch.stack([r0, r1], dim=1)  # [N, 2, 2]
                 A = F.softmax(rows, dim=-1, dtype=torch.float32)
@@ -468,12 +485,12 @@ class LunarisCodex(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        # Scale output weights with layer count and IRL steps for stability
+        # Scale output weights with layer count (remove IRL steps from scaling to avoid double-damping)
         if isinstance(module, (Attention, ReasoningFeedForward, MoCTopKExperts)):
             for name, p in module.named_parameters():
                 if name.endswith("o_proj.weight") or name.endswith("w2.weight"):
-                    steps = max(1, getattr(self.config, "n_reasoning_steps", 1))
-                    torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layers * steps))
+                    denom = math.sqrt(2 * self.config.n_layers)
+                    torch.nn.init.normal_(p, mean=0.0, std=0.02 / denom)
 
     def forward(
         self,
@@ -570,6 +587,7 @@ class LunarisCodex(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        was_training = self.training
         self.eval()
         past_key_values = None
         for _ in range(max_new_tokens):
@@ -585,7 +603,8 @@ class LunarisCodex(nn.Module):
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
-        self.train()
+        if was_training:
+            self.train()
         return idx
 
 def compile_model_if_available(model: nn.Module, mode: str = "max-autotune"):
@@ -618,6 +637,8 @@ if __name__ == "__main__":
             aux_loss_weight=1e-2,
             capacity_factor=1.25,
             router_z_loss_weight=1e-3,
+            router_noise_std=0.05,      # small noise for exploration
+            drop_penalty_weight=1e-3,   # overflow penalty
             use_gradient_checkpointing=True,
             grad_ckpt_policy="ffn",
             save_attn_weights=False,
