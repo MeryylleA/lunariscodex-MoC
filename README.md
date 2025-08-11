@@ -1,6 +1,7 @@
 # Lunaris MoC — Mixture of Collaboration with IRL
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/MeryylleA/lunariscodex-MoC)
 
 Lunaris MoC is a research‑grade, production‑oriented Transformer with **Mixture‑of‑Collaboration (MoC)** blocks and **Iterative Reasoning Loops (IRL)**. The core idea: per‑token **routing selects K paths**, these paths **collaborate** (exchange information) before a **learned fusion** produces the block output. Inside each path, a lightweight **IRL** performs a few refinement steps without adding parameters.
 
