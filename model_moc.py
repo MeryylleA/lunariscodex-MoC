@@ -2,19 +2,25 @@ import math
 import inspect
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-# Global backend hints for H100/GH200
-torch.set_float32_matmul_precision("high")
+# -----------------------------------------------------------------------------
+# Global backend hints for H100/GH200 (safe no-ops on CPU)
+# -----------------------------------------------------------------------------
 try:
+    torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 except Exception:
     pass
 
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 @dataclass
 class LunarisCodexConfig:
     d_model: int = 768
@@ -24,26 +30,35 @@ class LunarisCodexConfig:
     vocab_size: int = 50257
     multiple_of: int = 256
     ffn_hidden_multiplier: float = 4.0
-    max_seq_len: int = 1024
+    max_seq_len: int = 2048
     rope_theta: float = 10000.0
     dropout: float = 0.0
     # MoE / MoC parameters
     n_experts: Optional[int] = 8
-    top_k: int = 2  # fixed top-k > 1
+    top_k: int = 2
     aux_loss_weight: float = 1e-2
     capacity_factor: float = 1.25
     router_z_loss_weight: float = 1e-3
-    router_noise_std: float = 0.0          # training-time router noise; e.g., 0.01–0.1
-    drop_penalty_weight: float = 1e-3      # penalize overflow drops
+    router_noise_std: float = 0.0
+    drop_penalty_weight: float = 1e-3
     # Engineering
     use_gradient_checkpointing: bool = True
-    grad_ckpt_policy: str = "ffn"          # "none" | "ffn" | "block"
+    grad_ckpt_policy: str = "ffn"  # "none" | "ffn" | "block"
     save_attn_weights: bool = False
-    # Simple collab flags
-    use_simple_collab: bool = True
+    # Collaboration modes
+    use_simple_collab: bool = False        # set False: default to MoC collaborative path
+    use_moc_collab: bool = True            # explicit flag (kept for clarity)
     simple_collab_dropout: float = 0.1
-    # IRL: number of iterative reasoning steps inside each expert FFN
+    moc_collab_steps: int = 2              # rounds of expert<->expert message passing
+    moc_collab_heads: int = 4              # heads for expert-level attention
+    moc_collab_dropout: float = 0.0        # dropout inside MoC collaboration
+    moc_use_mediator: bool = True          # add a learnable mediator token per token
+    # IRL: iterative reasoning steps inside each FFN/expert
     n_reasoning_steps: int = 1
+
+# -----------------------------------------------------------------------------
+# Rotary Embeddings
+# -----------------------------------------------------------------------------
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
@@ -51,6 +66,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
+
 
 def apply_rotary_emb(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
@@ -64,6 +80,9 @@ def apply_rotary_emb(
     xk_out = torch.view_as_real(xk_ * freqs_cis).reshape(B, H, T, D).to(dtype=xk.dtype)
     return xq_out, xk_out
 
+# -----------------------------------------------------------------------------
+# Attention (Flash SDP, GQA)
+# -----------------------------------------------------------------------------
 class Attention(nn.Module):
     def __init__(self, config: LunarisCodexConfig):
         super().__init__()
@@ -93,13 +112,13 @@ class Attention(nn.Module):
             [self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim, self.n_kv_heads * self.head_dim],
             dim=-1,
         )
-        # Reshape to heads-first
+        # heads-first
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2).contiguous()  # [B, H, T, D]
         k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
         v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2).contiguous()
 
-        # RoPE
-        q, k = apply_rotary_emb(q, k, freqs_cis)  # [B, H, T, D], [B, Hkv, T, D]
+        # RoPE (fp32 angles)
+        q, k = apply_rotary_emb(q, k, freqs_cis)
 
         # KV cache append
         if past_kv is not None:
@@ -108,13 +127,13 @@ class Attention(nn.Module):
             v = torch.cat((past_v, v), dim=-2)
         present_kv = (k, v)
 
-        # GQA: repeat KV heads if needed
+        # GQA: expand KV heads if needed
         if self.n_kv_heads < self.n_heads:
             n_repeats = self.n_heads // self.n_kv_heads
             k = k.repeat_interleave(n_repeats, dim=1)
             v = v.repeat_interleave(n_repeats, dim=1)
 
-        # Causal attention with Flash SDP; pass dropout in training
+        # Causal attention with Flash SDP; dropout only in training
         attn_dropout = self.dropout.p if self.training and self.dropout.p > 0 else 0.0
         with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=attn_dropout)  # [B, H, T, D]
@@ -123,6 +142,9 @@ class Attention(nn.Module):
         y = self.dropout(self.o_proj(y))
         return y, present_kv
 
+# -----------------------------------------------------------------------------
+# Reasoning FFN (IRL inside)
+# -----------------------------------------------------------------------------
 class ReasoningFeedForward(nn.Module):
     def __init__(self, config: LunarisCodexConfig):
         super().__init__()
@@ -133,7 +155,7 @@ class ReasoningFeedForward(nn.Module):
         self.w13 = nn.Linear(config.d_model, 2 * hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
-        # IRL steps e escala residual
+        # IRL steps & residual scaling
         self.n_reasoning_steps = int(getattr(config, "n_reasoning_steps", 1))
         self.alpha = 1.0 / math.sqrt(max(1, self.n_reasoning_steps))
 
@@ -142,16 +164,33 @@ class ReasoningFeedForward(nn.Module):
         swiglu = F.silu(gate) * up
         return self.dropout(self.w2(swiglu))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = x
         steps = max(1, self.n_reasoning_steps)
         for _ in range(steps):
             h = h + self.alpha * self._ffn_logic(h + x)
         return h
 
+# -----------------------------------------------------------------------------
+# Helper to pick a valid head count for MoC collaboration
+# -----------------------------------------------------------------------------
+
+def _pick_heads(d_model: int, preferred: int) -> int:
+    h = min(preferred, 8)
+    while h > 1 and d_model % h != 0:
+        h -= 1
+    return max(1, h)
+
+# -----------------------------------------------------------------------------
+# MoC-on-Top-K Experts (vectorized routing + collaborative message passing)
+# -----------------------------------------------------------------------------
 class MoCTopKExperts(nn.Module):
     """
-    MoC core on top of optimized MoE foundation with simple collaboration by default.
+    Research-first MoC core: vectorized sorted routing + capacity + *collaboration between experts*.
+    - Router/aux in fp32 with optional noise.
+    - Experts are IRL FFNs.
+    - Collaboration: R rounds of MHA+FFN across the K selected experts (+ optional mediator token),
+      then gated fusion between mediator and weighted expert aggregate.
     """
     def __init__(self, config: LunarisCodexConfig):
         super().__init__()
@@ -159,63 +198,56 @@ class MoCTopKExperts(nn.Module):
         assert config.top_k >= 1
         self.n_experts = int(config.n_experts)
         self.top_k = int(config.top_k)
-        self.aux_loss_weight = config.aux_loss_weight
-        self.capacity_factor = config.capacity_factor
-        self.z_loss_weight = config.router_z_loss_weight
+        self.aux_loss_weight = float(config.aux_loss_weight)
+        self.capacity_factor = float(config.capacity_factor)
+        self.z_loss_weight = float(config.router_z_loss_weight)
+        self.drop_penalty_weight = float(getattr(config, "drop_penalty_weight", 0.0))
         self.config = config
 
-        # Router gate
+        # Router gate (fp32 compute later)
         self.gate = nn.Linear(config.d_model, self.n_experts, bias=False)
 
         # Experts
         self.experts = nn.ModuleList([ReasoningFeedForward(config) for _ in range(self.n_experts)])
 
-        # Legacy collaboration sub-layer (kept for compatibility)
         D = config.d_model
-        attn_heads = min(max(1, self.top_k), config.n_heads)
-        if D % attn_heads != 0:
-            attn_heads = 1  # garante divisibilidade
-        self.collab_attn = nn.MultiheadAttention(
-            embed_dim=D, num_heads=attn_heads, dropout=config.dropout, batch_first=True
-        )
-        self.collab_norm = nn.RMSNorm(D, eps=1e-6)
-        self.collab_ffn = nn.Sequential(
-            nn.Linear(D, D, bias=False),
-            nn.GELU(),
-            nn.Linear(D, D, bias=False),
-        )
+        # Collaboration stack
+        h = _pick_heads(D, config.moc_collab_heads)
+        self.collab_attn = nn.MultiheadAttention(embed_dim=D, num_heads=h, dropout=config.moc_collab_dropout, batch_first=True)
+        self.collab_norm1 = nn.RMSNorm(D, eps=1e-6)
+        self.collab_ffn = nn.Sequential(nn.Linear(D, D, bias=False), nn.GELU(), nn.Linear(D, D, bias=False))
+        self.collab_norm2 = nn.RMSNorm(D, eps=1e-6)
+        self.moc_collab_steps = max(1, int(config.moc_collab_steps))
+        if config.moc_use_mediator:
+            self.mediator = nn.Parameter(torch.empty(1, 1, D))
+            nn.init.normal_(self.mediator, mean=0.0, std=0.02)
+        else:
+            self.mediator = None
+        # Gating between mediator and weighted expert sum
+        self.fuse_gate = nn.Linear(D, 1, bias=True)
+
         # Output projection
         self.o_proj = nn.Linear(D, D, bias=False)
 
-        # Simple collaboration projections
+        # Simple path preserved for compatibility when explicitly requested
         self.msg_proj = nn.Linear(D, D, bias=False)
         self.q_proj = nn.Linear(D, D, bias=False)
         self.k_proj = nn.Linear(D, D, bias=False)
-        self.upd = nn.Sequential(
-            nn.Linear(2 * D, 2 * D, bias=False),
-            nn.GELU(),
-            nn.Dropout(config.simple_collab_dropout),
-            nn.Linear(2 * D, D, bias=False),
-        )
+
         self.save_attn_weights = bool(getattr(config, "save_attn_weights", False))
         self.last_attn_weights = None
 
     @staticmethod
-    def _load_balance_loss_topk(
-        router_probs: torch.Tensor, topk_idx: torch.Tensor, topk_probs: torch.Tensor, n_experts: int
-    ) -> torch.Tensor:
-        # router_probs: [N, E] float32
-        # topk_idx/topk_probs: [N, K]
+    def _load_balance_loss_topk(router_probs, topk_idx, topk_probs, n_experts: int) -> torch.Tensor:
         N, E = router_probs.shape
-        assign = router_probs.new_zeros(N, E)  # expected assignment mass per expert
+        assign = router_probs.new_zeros(N, E)
         for j in range(topk_idx.size(1)):
-            assign.scatter_add_(1, topk_idx[:, j:j+1], topk_probs[:, j:j+1])
+            assign.scatter_add_(1, topk_idx[:, j:j + 1], topk_probs[:, j:j + 1])
         fraction_tokens = assign.mean(dim=0)  # [E]
         prob_mass = router_probs.mean(dim=0)  # [E]
         return (prob_mass * fraction_tokens).sum() * n_experts
 
     def _capacity_limit(self, total_slots: int) -> int:
-        # Power-of-two capacity close to average * capacity_factor
         avg = total_slots / max(1, self.n_experts)
         target = int(math.ceil(avg * self.capacity_factor))
         if target <= 0:
@@ -223,197 +255,152 @@ class MoCTopKExperts(nn.Module):
         return 1 << int(math.ceil(math.log2(target)))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        x: [B, T, D]
-        Returns:
-          y: fused output [B, T, D]
-          aux_loss: scalar Tensor
-          expert_indices: [B, T, K] per token selected experts (long), or empty tensor if none
-        """
         B, T, D = x.shape
         N = B * T
         x_flat = x.view(N, D)
 
-        # Router em fp32 (+ ruído opcional)
+        # Router in fp32 (+ optional noise during training)
         logits = self.gate(x_flat.to(torch.float32))  # [N, E]
         if self.training and getattr(self.config, "router_noise_std", 0.0) > 0.0:
             logits = logits + torch.randn_like(logits) * float(self.config.router_noise_std)
 
-        # top-k selection
-        topk_vals, topk_idx = torch.topk(logits, k=self.top_k, dim=-1)  # [N, K]
-        topk_probs = F.softmax(topk_vals, dim=-1, dtype=torch.float32)  # [N, K]
+        # Top-k (dispatch) and fp32 probs for losses
+        topk_vals, topk_idx = torch.topk(logits, k=self.top_k, dim=-1)               # [N, K]
+        topk_probs = F.softmax(topk_vals, dim=-1, dtype=torch.float32)               # [N, K]
+        router_probs = F.softmax(logits, dim=-1, dtype=torch.float32)                # [N, E]
 
-        # Aux losses (balance + z-loss)
-        router_probs = F.softmax(logits, dim=-1, dtype=torch.float32)  # [N, E]
         balance_loss = self._load_balance_loss_topk(router_probs, topk_idx, topk_probs, self.n_experts)
         z = torch.logsumexp(logits, dim=-1)
         z_loss = (z * z).mean()
         aux_loss = self.aux_loss_weight * balance_loss + self.z_loss_weight * z_loss
 
-        # Dispatch expandido por K
+        # Expand dispatch by K
         N_K = N * self.top_k
         x_expanded = x_flat.unsqueeze(1).expand(-1, self.top_k, -1).reshape(N_K, D)  # [N*K, D]
-        target_expert = topk_idx.reshape(-1)  # [N*K]
-        prio = topk_vals.reshape(-1)          # [N*K]
+        target_expert = topk_idx.reshape(-1)                                         # [N*K]
+        prio = topk_vals.reshape(-1)                                                 # [N*K]
 
-        # Capacidade por expert (alinhada a potências de 2)
+        # Capacity per expert (power-of-two)
         C = self._capacity_limit(N_K)
 
-        # Buffers de saída
-        expert_out_selected = x_expanded.new_zeros((N_K, D))  # [N*K, D]
+        # Outputs for per-expert path
+        expert_out_selected = x_expanded.new_zeros((N_K, D))
         keep_mask = torch.zeros(N_K, dtype=torch.bool, device=x.device)
         total_dropped = 0
 
-        # Processa experts em segmentos (simples e robusto)
+        # Sorted routing
+        idx_sorted = torch.argsort(target_expert)
+        counts = torch.bincount(target_expert, minlength=self.n_experts)
+        seg_ends = counts.cumsum(0)
+        seg_starts = torch.cat([torch.zeros(1, device=x.device, dtype=torch.long), seg_ends[:-1]])
+
         for e in range(self.n_experts):
-            idx_e = (target_expert == e).nonzero(as_tuple=False).squeeze(-1)
-            n_e = idx_e.numel()
-            if n_e == 0:
+            s = int(seg_starts[e].item()); t = int(seg_ends[e].item())
+            if t <= s:
                 continue
+            span = idx_sorted[s:t]
+            n_e = int(span.numel())
             if C <= 0:
                 total_dropped += n_e
                 continue
-            if n_e <= C:
-                kept_idx = idx_e
-            else:
-                prio_e = prio.index_select(0, idx_e)
-                _, local_top = torch.topk(prio_e, k=C, largest=True, sorted=False)
-                kept_idx = idx_e.index_select(0, local_top)
-                total_dropped += int(n_e - C)
+            if n_e > C:
+                prio_e = prio.index_select(0, span)
+                keep_local = torch.topk(prio_e, k=C, largest=True, sorted=False).indices
+                span = span.index_select(0, keep_local)
+                total_dropped += n_e - C
 
-            seg = x_expanded.index_select(0, kept_idx)  # [kept, D]
-            y = self.experts[e](seg)                    # [kept, D]
-            expert_out_selected.index_copy_(0, kept_idx, y)
-            keep_mask.index_fill_(0, kept_idx, True)
+            seg_x = x_expanded.index_select(0, span)
+            y = self.experts[e](seg_x)
+            expert_out_selected.index_copy_(0, span, y)
+            keep_mask.index_fill_(0, span, True)
 
-        # Reformatar para [N, K, D]
-        selected = expert_out_selected.view(N, self.top_k, D)   # [N, K, D]
-        kept_mask_nk = keep_mask.view(N, self.top_k)            # [N, K]
+        # Drop penalty
+        if self.drop_penalty_weight > 0.0 and N_K > 0:
+            drop_frac = float(total_dropped) / float(N_K)
+            aux_loss = aux_loss + x_flat.new_tensor(self.drop_penalty_weight * drop_frac, dtype=aux_loss.dtype)
 
-        # Penaliza drops
-        if N_K > 0 and self.config.drop_penalty_weight > 0:
-            drop_frac = 1.0 - keep_mask.to(torch.float32).mean()
-            aux_loss = aux_loss + self.config.drop_penalty_weight * drop_frac
+        # Arrange [N, K, D] and masks
+        expert_states = expert_out_selected.view(N, self.top_k, D)
+        kept_mask_nk = keep_mask.view(N, self.top_k)
+        expert_states = expert_states * kept_mask_nk.unsqueeze(-1)
+        topk_probs_masked = (topk_probs * kept_mask_nk.to(topk_probs.dtype)).to(expert_states.dtype)  # [N, K]
+        denom = topk_probs_masked.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        weights = topk_probs_masked / denom
 
-        if self.config.use_simple_collab:
-            dtype = selected.dtype
-            M = self.msg_proj(selected)    # [N, K, D]
-            Q = self.q_proj(selected)      # [N, K, D]
-            Kk = self.k_proj(M)            # [N, K, D]
-
-            # Scores em fp32
-            scores = torch.matmul(Q.to(torch.float32), Kk.to(torch.float32).transpose(1, 2))
-            scores = scores / math.sqrt(D)
-
-            # Máscara de pares válidos
-            km = kept_mask_nk.to(torch.bool)
-            if self.top_k == 2:
-                s00 = scores[:, 0, 0]; s01 = scores[:, 0, 1]
-                s10 = scores[:, 1, 0]; s11 = scores[:, 1, 1]
-                k0 = km[:, 0]; k1 = km[:, 1]
-                neg_min = torch.finfo(scores.dtype).min
-                r0c0 = torch.where(k0 & k0, s00, torch.tensor(neg_min, dtype=scores.dtype, device=scores.device))
-                r0c1 = torch.where(k0 & k1, s01, torch.tensor(neg_min, dtype=scores.dtype, device=scores.device))
-                r1c0 = torch.where(k1 & k0, s10, torch.tensor(neg_min, dtype=scores.dtype, device=scores.device))
-                r1c1 = torch.where(k1 & k1, s11, torch.tensor(neg_min, dtype=scores.dtype, device=scores.device))
-                r0 = torch.stack([r0c0, r0c1], dim=-1)
-                r1 = torch.stack([r1c0, r1c1], dim=-1)
-                rows = torch.stack([r0, r1], dim=1)  # [N, 2, 2]
-                A = F.softmax(rows, dim=-1, dtype=torch.float32)
-                valid_pairs = (km.unsqueeze(2) & km.unsqueeze(1)).to(A.dtype)  # [N,2,2]
-                A = A * valid_pairs
-                denomA = A.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                A = (A / denomA).to(dtype)
-            else:
-                row_mask = km.unsqueeze(2)  # [N, K, 1]
-                col_mask = km.unsqueeze(1)  # [N, 1, K]
-                valid_pairs = row_mask & col_mask  # [N, K, K]
-                scores = scores.masked_fill(~valid_pairs, torch.finfo(scores.dtype).min)
-                A = F.softmax(scores, dim=-1, dtype=torch.float32)  # [N, K, K]
-                A = A * valid_pairs.to(A.dtype)
-                denomA = A.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                A = (A / denomA).to(dtype)
-
-            # Combinação de contexto e fusão
-            Cctx = torch.matmul(A, M)  # [N, K, D]
-            refined = selected + self.upd(torch.cat([selected, Cctx], dim=-1))  # [N, K, D]
-
-            refined = refined * kept_mask_nk.unsqueeze(-1)
-            topk_probs_ = (topk_probs * kept_mask_nk.to(topk_probs.dtype)).to(refined.dtype)
-            denom = topk_probs_.sum(dim=-1, keepdim=True).clamp_min(1e-12)  # [N, 1]
-            weights = (topk_probs_ / denom)  # [N, K]
-            fused = torch.sum(refined * weights.unsqueeze(-1), dim=1)  # [N, D]
+        # --- Collaboration paths ---
+        if self.config.use_simple_collab and not self.config.use_moc_collab:
+            # Lightweight fusion (legacy simple path)
+            fused = torch.sum(expert_states * weights.unsqueeze(-1), dim=1)  # [N, D]
             fused = self.o_proj(fused).view(B, T, D)
             expert_indices = topk_idx.view(B, T, self.top_k).to(torch.long)
             return fused, aux_loss.to(fused.dtype), expert_indices
 
-        # Legacy collaboration: MHA sobre K com máscara
-        x_collab_in = selected  # [N, K, D]
+        # MoC collaborative message passing among experts (+ optional mediator)
+        # tokens_in: [N, K(+1), D]
+        tokens_in = expert_states
+        key_padding_mask = ~kept_mask_nk  # True = ignore pad
+        if self.mediator is not None:
+            m = self.mediator.expand(N, 1, D).to(tokens_in.dtype)
+            tokens_in = torch.cat([tokens_in, m], dim=1)
+            pad_ext = torch.zeros(N, 1, dtype=key_padding_mask.dtype, device=key_padding_mask.device)
+            key_padding_mask = torch.cat([key_padding_mask, pad_ext], dim=1)
+        # R rounds of Attn + FFN
+        tokens = tokens_in
         need_w = self.save_attn_weights
-        try:
+        attn_w = None
+        for _ in range(self.moc_collab_steps):
             with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
-                attn_out, attn_weights = self.collab_attn(
-                    x_collab_in, x_collab_in, x_collab_in,
-                    need_weights=need_w,
-                    key_padding_mask=~kept_mask_nk  # True mascara
-                )
-        except Exception:
-            out = self.collab_attn(
-                x_collab_in, x_collab_in, x_collab_in,
-                need_weights=need_w,
-                key_padding_mask=~kept_mask_nk
-            )
-            attn_out, attn_weights = (out if need_w else (out[0] if isinstance(out, tuple) else out, None))
-
+                out, attn_w = self.collab_attn(tokens, tokens, tokens, need_weights=need_w, key_padding_mask=key_padding_mask)
+            tokens = self.collab_norm1(tokens + out)
+            tokens = tokens + self.collab_ffn(self.collab_norm2(tokens))
         if need_w:
-            self.last_attn_weights = attn_weights
+            self.last_attn_weights = attn_w
 
-        collab = self.collab_norm(attn_out + x_collab_in)
-        refined = self.collab_ffn(collab) + collab  # [N, K, D]
-        topk_probs_ = topk_probs.to(refined.dtype)  # [N, K]
-        refined = refined * kept_mask_nk.unsqueeze(-1)
-        topk_probs_ = topk_probs_ * kept_mask_nk.to(topk_probs_.dtype)
-        denom = topk_probs_.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        weights = topk_probs_ / denom
-        fused = torch.sum(refined * weights.unsqueeze(-1), dim=1)  # [N, D]
+        # Split back
+        if self.mediator is not None:
+            mediator_out = tokens[:, -1, :]
+            expert_refined = tokens[:, :-1, :]
+        else:
+            mediator_out = tokens.mean(dim=1)
+            expert_refined = tokens
+
+        expert_refined = expert_refined * (~key_padding_mask[:, :self.top_k]).unsqueeze(-1)
+        weighted = torch.sum(expert_refined * weights.unsqueeze(-1), dim=1)  # [N, D]
+
+        # Gate between mediator and weighted expert aggregate
+        gamma = torch.sigmoid(self.fuse_gate(x_flat)).view(N, 1)
+        fused = gamma * mediator_out + (1.0 - gamma) * weighted
+
         fused = self.o_proj(fused).view(B, T, D)
         expert_indices = topk_idx.view(B, T, self.top_k).to(torch.long)
         return fused, aux_loss.to(fused.dtype), expert_indices
 
+# -----------------------------------------------------------------------------
+# Transformer Block (checkpoint policies: none/ffn/block)
+# -----------------------------------------------------------------------------
 class Block(nn.Module):
     def __init__(self, config: LunarisCodexConfig):
         super().__init__()
         self.config = config
-        # Pre-LN na atenção
         self.attn_norm = nn.RMSNorm(config.d_model, eps=1e-6)
         self.attention = Attention(config)
-
         self.ffn_norm = nn.RMSNorm(config.d_model, eps=1e-6)
         if config.n_experts is not None and config.n_experts > 0 and config.top_k >= 1:
             self.feed_forward = MoCTopKExperts(config)
             self.is_moe = True
-            print(f"Block initialized with MoC-on-MoE: {config.n_experts} experts, top_k={config.top_k}.")
+            print(f"Block with MoC collaboration: {config.n_experts} experts, top_k={config.top_k}.")
         else:
             self.feed_forward = ReasoningFeedForward(config)
             self.is_moe = False
-            print("Block initialized with standard ReasoningFeedForward network.")
+            print("Block with standard ReasoningFeedForward.")
 
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor],
-        torch.Tensor,
-        Optional[torch.Tensor],
-    ]:
-        def _inner_full(
-            x_inner: torch.Tensor,
-            freqs_cis_inner: torch.Tensor,
-            past_kv_inner: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        ):
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
+        def _inner_full(x_inner: torch.Tensor, freqs_cis_inner: torch.Tensor, past_kv_inner: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
             attn_output, new_kv = self.attention(self.attn_norm(x_inner), freqs_cis_inner, past_kv_inner)
             h = x_inner + attn_output
             ffn_input = self.ffn_norm(h)
@@ -426,12 +413,10 @@ class Block(nn.Module):
             out = h + ffn_output
             return out, new_kv, aux_loss, expert_indices
 
-        # Checkpoint policy
         if self.training and self.config.use_gradient_checkpointing:
             if self.config.grad_ckpt_policy == "block":
                 return checkpoint(_inner_full, x, freqs_cis, past_kv, use_reentrant=False)
             elif self.config.grad_ckpt_policy == "ffn":
-                # Atenção sem checkpoint, checkpoint apenas no FFN
                 attn_output, new_kv = self.attention(self.attn_norm(x), freqs_cis, past_kv)
                 h = x + attn_output
                 ffn_input = self.ffn_norm(h)
@@ -453,6 +438,9 @@ class Block(nn.Module):
         else:
             return _inner_full(x, freqs_cis, past_kv)
 
+# -----------------------------------------------------------------------------
+# Top-level Model
+# -----------------------------------------------------------------------------
 class LunarisCodex(nn.Module):
     def __init__(self, config: LunarisCodexConfig):
         super().__init__()
@@ -492,7 +480,7 @@ class LunarisCodex(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def _rescale_out_projections(self):
-        # Escala apenas as projeções de saída: Attention.o_proj, FFN.w2, MoC.o_proj
+        # Scale only output projections: Attention.o_proj, FFN.w2, MoC.o_proj
         denom = math.sqrt(2 * self.config.n_layers)
         with torch.no_grad():
             for m in self.modules():
@@ -508,12 +496,7 @@ class LunarisCodex(nn.Module):
         idx: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        Optional[tuple],
-        List[Tuple[torch.Tensor, torch.Tensor]],
-        Optional[List[torch.Tensor]],
-    ]:
+    ) -> Tuple[torch.Tensor, Optional[tuple], List[Tuple[torch.Tensor, torch.Tensor]], Optional[List[torch.Tensor]]]:
         B, T = idx.shape
         start_pos = past_key_values[0][0].shape[-2] if past_key_values is not None else 0
         assert start_pos + T <= self.config.max_seq_len, \
@@ -522,12 +505,11 @@ class LunarisCodex(nn.Module):
         x = self.transformer.wte(idx)
         x = self.transformer.drop(x)
 
-        # RoPE freqs como slice fp32 no device
         freqs_cis = self.freqs_cis[start_pos: start_pos + T].to(dtype=torch.float32, device=x.device)
 
         new_past_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
         total_aux_loss = x.new_zeros(())
-        expert_indices_list = []
+        expert_indices_list: List[torch.Tensor] = []
 
         for i, block in enumerate(self.transformer.h):
             past_kv_for_block = past_key_values[i] if past_key_values is not None else None
@@ -558,7 +540,7 @@ class LunarisCodex(nn.Module):
             return logits, None, new_past_key_values, None
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # Separar router params com LR menor
+        # Separate router params (lower LR, no WD); keep stable naming
         router_params, decay_params, nodecay_params = [], [], []
         router_param_ids = set()
         for n, p in self.named_parameters():
@@ -571,7 +553,6 @@ class LunarisCodex(nn.Module):
                 decay_params.append(p)
             else:
                 nodecay_params.append(p)
-        # Robustez a naming
         for n, p in self.named_parameters():
             if n.endswith('feed_forward.gate.weight'):
                 if id(p) not in router_param_ids:
@@ -590,7 +571,7 @@ class LunarisCodex(nn.Module):
             ],
             lr=learning_rate,
             betas=betas,
-            fused=use_fused
+            fused=use_fused,
         )
         print(f"using fused AdamW: {use_fused}")
         return optimizer
@@ -617,6 +598,10 @@ class LunarisCodex(nn.Module):
             self.train()
         return idx
 
+# -----------------------------------------------------------------------------
+# Compile helper (kept for training compatibility)
+# -----------------------------------------------------------------------------
+
 def compile_model_if_available(model: nn.Module, mode: str = "max-autotune"):
     try:
         model = torch.compile(model, mode=mode)
@@ -625,56 +610,54 @@ def compile_model_if_available(model: nn.Module, mode: str = "max-autotune"):
         print(f"torch.compile not enabled or failed: {e}")
     return model
 
+
 if __name__ == "__main__":
-    # Minimal sanity tests for both collaboration modes.
+    # Minimal sanity tests
     torch.manual_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    def run_sanity(use_simple: bool):
-        print(f"\nRunning sanity with use_simple_collab={use_simple}")
-        cfg = LunarisCodexConfig(
-            d_model=64,
-            n_layers=2,
-            n_heads=4,
-            n_kv_heads=4,
-            vocab_size=503,
-            multiple_of=16,
-            ffn_hidden_multiplier=4.0,
-            max_seq_len=64,
-            dropout=0.0,
-            n_experts=4,
-            top_k=2,
-            aux_loss_weight=1e-2,
-            capacity_factor=1.25,
-            router_z_loss_weight=1e-3,
-            router_noise_std=0.05,      # small noise for exploration
-            drop_penalty_weight=1e-3,   # overflow penalty
-            use_gradient_checkpointing=True,
-            grad_ckpt_policy="ffn",
-            save_attn_weights=False,
-            use_simple_collab=use_simple,
-            simple_collab_dropout=0.1,
-            n_reasoning_steps=3,  # test IRL with >1 steps
-        )
-        model = LunarisCodex(cfg).to(device)
-        model.train()
+    cfg = LunarisCodexConfig(
+        d_model=64,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=4,
+        vocab_size=503,
+        multiple_of=16,
+        ffn_hidden_multiplier=4.0,
+        max_seq_len=64,
+        dropout=0.0,
+        n_experts=4,
+        top_k=2,
+        aux_loss_weight=1e-2,
+        capacity_factor=1.25,
+        router_z_loss_weight=1e-3,
+        router_noise_std=0.02,
+        drop_penalty_weight=1e-3,
+        use_gradient_checkpointing=True,
+        grad_ckpt_policy="ffn",
+        save_attn_weights=False,
+        use_simple_collab=False,
+        use_moc_collab=True,
+        simple_collab_dropout=0.1,
+        moc_collab_steps=2,
+        moc_collab_heads=4,
+        moc_collab_dropout=0.0,
+        moc_use_mediator=True,
+        n_reasoning_steps=2,
+    )
+    model = LunarisCodex(cfg).to(device)
 
-        B, T = 2, 8
-        idx = torch.randint(0, cfg.vocab_size, (B, T), device=device)
-        targets = torch.randint(0, cfg.vocab_size, (B, T), device=device)
-        logits, loss_tuple, _, expert_info = model(idx, targets=targets)
-        total_loss, ce_loss, aux_loss = loss_tuple
-        print(f"Losses -> total: {total_loss.item():.4f}, ce: {ce_loss.item():.4f}, aux: {aux_loss.item():.6f}")
-        assert logits.shape == (B, T, cfg.vocab_size)
-        assert isinstance(expert_info, list)
+    B, T = 2, 8
+    idx = torch.randint(0, cfg.vocab_size, (B, T), device=device)
+    targets = torch.randint(0, cfg.vocab_size, (B, T), device=device)
 
-        # Inference/generate
-        model.eval()
-        start = torch.randint(0, cfg.vocab_size, (B, 4), device=device)
-        out = model.generate(start, max_new_tokens=5, temperature=1.0, top_k=20)
-        print("Generate output shape:", out.shape)
-        assert out.shape[1] >= start.shape[1]
+    model.train()
+    logits, loss_tuple, _, expert_info = model(idx, targets=targets)
+    total_loss, ce_loss, aux_loss = loss_tuple
+    print(f"Losses -> total: {total_loss.item():.4f}, ce: {ce_loss.item():.4f}, aux: {aux_loss.item():.6f}")
+    assert logits.shape == (B, T, cfg.vocab_size)
 
-    run_sanity(use_simple=False)
-    run_sanity(use_simple=True)
-    print("\nSanity tests completed.")
+    model.eval()
+    out = model.generate(idx[:, :4], max_new_tokens=5)
+    print("Generate output shape:", out.shape)
+    print("Sanity complete.")
