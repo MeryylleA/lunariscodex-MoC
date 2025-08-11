@@ -1,0 +1,12 @@
+# Core (install the right PyTorch build for your CUDA from pytorch.org)
+torch>=2.1
+numpy>=1.26
+PyYAML>=6.0.1
+tqdm>=4.66
+
+# Optional: experiment tracking (only used if you set wandb_project)
+wandb>=0.16.0
+
+# Optional: data prep/tokenization (NOT required to train from .npy shards)
+# tokenizers>=0.15
+# sentencepiece>=0.1.99
