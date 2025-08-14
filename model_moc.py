@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 # -----------------------------------------------------------------------------
 # Global backend hints for H100/GH200 (safe no-ops on CPU)
@@ -75,7 +76,7 @@ def apply_rotary_emb(
     B, H, T, D = xq.shape
     xq_ = torch.view_as_complex(xq.reshape(B, H, T, D // 2, 2).to(torch.float32))
     xk_ = torch.view_as_complex(xk.reshape(B, H, T, D // 2, 2).to(torch.float32))
-    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)  # [1,1,T,D/2], fp32
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)  # [1,1,T,D/2], complex64
     xq_out = torch.view_as_real(xq_ * freqs_cis).reshape(B, H, T, D).to(dtype=xq.dtype)
     xk_out = torch.view_as_real(xk_ * freqs_cis).reshape(B, H, T, D).to(dtype=xk.dtype)
     return xq_out, xk_out
@@ -135,7 +136,7 @@ class Attention(nn.Module):
 
         # Causal attention with Flash SDP; dropout only in training
         attn_dropout = self.dropout.p if self.training and self.dropout.p > 0 else 0.0
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+        with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=attn_dropout)  # [B, H, T, D]
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -356,7 +357,7 @@ class MoCTopKExperts(nn.Module):
         need_w = self.save_attn_weights
         attn_w = None
         for _ in range(self.moc_collab_steps):
-            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+            with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
                 out, attn_w = self.collab_attn(tokens, tokens, tokens, need_weights=need_w, key_padding_mask=key_padding_mask)
             tokens = self.collab_norm1(tokens + out)
             tokens = tokens + self.collab_ffn(self.collab_norm2(tokens))
@@ -515,7 +516,7 @@ class LunarisCodex(nn.Module):
         x = self.transformer.wte(idx)
         x = self.transformer.drop(x)
 
-        freqs_cis = self.freqs_cis[start_pos: start_pos + T].to(dtype=torch.float32, device=x.device)
+        freqs_cis = self.freqs_cis[start_pos: start_pos + T].to(device=x.device)
 
         new_past_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
         total_aux_loss = x.new_zeros(())
