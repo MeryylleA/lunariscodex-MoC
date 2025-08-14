@@ -323,9 +323,16 @@ class MoCTopKExperts(nn.Module):
         expert_states = expert_out_selected.view(N, self.top_k, D)
         kept_mask_nk = keep_mask.view(N, self.top_k)
         expert_states = expert_states * kept_mask_nk.unsqueeze(-1)
-        topk_probs_masked = (topk_probs * kept_mask_nk.to(topk_probs.dtype)).to(expert_states.dtype)  # [N, K]
-        denom = topk_probs_masked.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        weights = topk_probs_masked / denom
+
+        # >>> PATCH: normalização estável em fp32 + fallback quando nenhum expert foi mantido <<<
+        topk_probs_masked_f32 = topk_probs * kept_mask_nk.to(topk_probs.dtype)            # [N, K], fp32
+        denom_f32 = topk_probs_masked_f32.sum(dim=-1, keepdim=True)                       # [N, 1], fp32
+        no_kept = (denom_f32 == 0)                                                        # [N, 1] bool
+        safe_denom_f32 = torch.where(no_kept, torch.ones_like(denom_f32), denom_f32)
+        weights_f32 = topk_probs_masked_f32 / safe_denom_f32                               # [N, K], fp32
+        weights_f32 = torch.where(no_kept, torch.zeros_like(weights_f32), weights_f32)     # zera linhas sem kept
+        weights = weights_f32.to(expert_states.dtype)
+        # <<< PATCH END >>>
 
         # --- Collaboration paths ---
         if self.config.use_simple_collab and not self.config.use_moc_collab:
@@ -415,7 +422,10 @@ class Block(nn.Module):
 
         if self.training and self.config.use_gradient_checkpointing:
             if self.config.grad_ckpt_policy == "block":
-                return checkpoint(_inner_full, x, freqs_cis, past_kv, use_reentrant=False)
+                # PATCH: checkpoint sem passar tuplas não-tensor
+                def _inner_ckpt(x_inner: torch.Tensor, freqs_cis_inner: torch.Tensor):
+                    return _inner_full(x_inner, freqs_cis_inner, past_kv)
+                return checkpoint(_inner_ckpt, x, freqs_cis, use_reentrant=False)
             elif self.config.grad_ckpt_policy == "ffn":
                 attn_output, new_kv = self.attention(self.attn_norm(x), freqs_cis, past_kv)
                 h = x + attn_output
