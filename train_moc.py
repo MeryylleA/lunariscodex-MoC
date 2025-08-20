@@ -1,16 +1,11 @@
 """
-Main Training Script for the LunarisCodex Language Model (MoC v2: top-k collaborative experts).
+Main Training Script for the LunarisCodex Language Model (MoC top-k collaborative experts).
 
-Key engineering features retained:
-- DDP-friendly with no_sync, gradient accumulation, gradient clipping.
-- bfloat16 autocast on H100/GH200; TF32 enabled; fused AdamW with router-specific LR.
-- torch.compile integration with safe fallback.
-- Robust checkpointing/resume; memory-efficient dataloading.
-- W&B logging: total/main/aux losses, perplexity, LR, grad-norm.
-- MoC-specific logging: top-k expert utilization and token-expert pair drop rate.
-
-Usage:
-    python train_moc_v2.py path/to/config.yaml
+- Apply dtype-handling patch: keep arrays in original dtype in Dataset; cast with `.to(...)` on GPU.
+- Enhance terminal & W&B logging: clearer metrics, tokens/sec, ETA, and memory hints.
+- Report "active parameters per token" as a dedicated log entry.
+- Add a novel architectural visual log (expert utilization & co-occurrence) without editing model_moc.py.
+- Save checkpoints twice every `save_interval` (numbered and latest) as required.
 """
 
 import os
@@ -18,7 +13,7 @@ import time
 import math
 import glob
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from contextlib import nullcontext
 
 import yaml
@@ -28,6 +23,14 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from tqdm import tqdm
+
+# Lazy import for visualization to avoid startup overhead if not used
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None  # We'll guard usage.
 
 from model_moc import LunarisCodex, LunarisCodexConfig, compile_model_if_available
 
@@ -54,12 +57,12 @@ class TrainConfig:
     out_dir: str = "checkpoints"
     log_interval: int = 20
     save_interval: int = 1000
-    save_latest_always: bool = True
+    save_latest_always: bool = True  # kept for backward-compat; we now always save twice per requirement
     num_workers: int = 4
     pin_memory: bool = True
     persistent_workers: bool = True
     prefetch_factor: int = 2
-    wandb_project: Optional[str] = "lunaris-codex-moc-v2"
+    wandb_project: Optional[str] = "lunaris-codex-moc"
     wandb_entity: Optional[str] = None
     wandb_run_name: Optional[str] = None
 
@@ -107,8 +110,8 @@ class TrainConfig:
 
 class ShardDataset(Dataset):
     """
-    Memory-efficient dataset over .npy token shards. Produces (x, y) with length seq_len.
-    Pads last sample with -1 if needed (ignored in CE loss).
+    Memory-efficient dataset over .npy token shards. Produces (x, y, valid_len_y) with length seq_len.
+    Padding tokens are neutral at load time; we set ignore_index on GPU to avoid dtype casting on CPU.
     """
     def __init__(self, data_dir: str, sequence_length: int):
         super().__init__()
@@ -129,13 +132,20 @@ class ShardDataset(Dataset):
     def __len__(self):
         return self.total_samples
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """
+        Returns:
+            x: torch Tensor (original dtype), length L
+            y: torch Tensor (original dtype), length L
+            valid_len_y: int count of valid targets in y (positions >= valid_len_y must be set to ignore_index on GPU)
+        """
         L = self.sequence_length
         token_start_pos = idx * L
         shard_idx = np.searchsorted(self.cumulative_lengths, token_start_pos, side='right')
         local_start_idx = token_start_pos if shard_idx == 0 else token_start_pos - self.cumulative_lengths[shard_idx - 1]
         seq_len_with_target = L + 1
 
+        # Fetch possibly across shard boundary (kept for correctness; see note below)
         if local_start_idx + seq_len_with_target <= self.shard_lengths[shard_idx]:
             seq = self.mmap_shards[shard_idx][local_start_idx: local_start_idx + seq_len_with_target]
         else:
@@ -144,17 +154,26 @@ class ShardDataset(Dataset):
             need = seq_len_with_target - remaining_len
             if shard_idx + 1 < len(self.mmap_shards):
                 seq_part2 = self.mmap_shards[shard_idx + 1][:need]
+                # NOTE: This concatenation happens in CPU; we keep dtype and avoid astype here by design.
                 seq = np.concatenate((seq_part1, seq_part2))
             else:
                 seq = seq_part1
 
-        if len(seq) < seq_len_with_target:
-            pad_len = seq_len_with_target - len(seq)
-            seq = np.pad(seq, (0, pad_len), 'constant', constant_values=-1)
+        # Determine how many targets are valid BEFORE padding
+        orig_len = int(len(seq))
+        valid_len_y = int(max(0, min(L, orig_len - 1)))
 
-        seq_tensor = torch.from_numpy(seq.astype(np.int64))
+        # Pad up to L+1 without forcing dtype promotion on CPU
+        if orig_len < seq_len_with_target:
+            pad_len = seq_len_with_target - orig_len
+            # Use zero-pad in the same dtype; we will set ignore_index (-1) on GPU later.
+            pad_val = np.array(0, dtype=seq.dtype)
+            seq = np.pad(seq, (0, pad_len), 'constant', constant_values=pad_val)
+
+        # Important: keep original dtype here; cast only on GPU later.
+        seq_tensor = torch.from_numpy(seq)
         x, y = seq_tensor[:-1], seq_tensor[1:]
-        return x, y
+        return x, y, valid_len_y
 
 # ---------------------------
 # DDP / utils
@@ -193,6 +212,26 @@ def unwrap_model_keys(state_dict):
         unwrapped[new_k] = v
     return unwrapped
 
+def compute_active_params_per_token(model: LunarisCodex) -> Tuple[int, int]:
+    """
+    Estimates the number of *active* parameters used per token given MoE/MoC routing.
+    We count all non-expert params, and for each MoE block we add K * (per-expert params) instead of E * per-expert.
+    """
+    total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    reduction = 0
+    for block in model.transformer.h:
+        if getattr(block, "is_moe", False):
+            moc = block.feed_forward  # MoCTopKExperts
+            if len(moc.experts) == 0:
+                continue
+            # Assume experts are homogenous
+            per_expert = sum(p.numel() for p in moc.experts[0].parameters() if p.requires_grad)
+            nE = int(getattr(moc, "n_experts", len(moc.experts)))
+            k = int(getattr(moc, "top_k", 1))
+            reduction += max(0, (nE - k)) * per_expert
+    active = total_trainable - reduction
+    return int(active), int(total_trainable)
+
 # ---------------------------
 # Training
 # ---------------------------
@@ -207,6 +246,7 @@ def train(config_path: str):
     np.random.seed(1337 + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     device_type = 'cuda' if 'cuda' in config.device else 'cpu'
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
@@ -217,22 +257,25 @@ def train(config_path: str):
     if is_master:
         os.makedirs(config.out_dir, exist_ok=True)
         if config.wandb_run_name is None:
-            config.wandb_run_name = f"run-mocv2-{time.strftime('%Y-%m-%d-%H-%M')}"
-        print("-" * 60)
-        print(" LUNARIS CODEX - MoC v2 (top-k collaborative experts) Training")
-        print("-" * 60)
+            config.wandb_run_name = f"run-moc-{time.strftime('%Y-%m-%d-%H-%M')}"
+        print("-" * 72)
+        print(" LUNARIS CODEX - MoC (top-k collaborative experts) Training")
+        print("-" * 72)
         print(f"Model: {config.model}")
         if config.model.n_experts:
             print(f"MoC: experts={config.model.n_experts}, top_k={config.model.top_k}, "
                   f"cap_factor={config.model.capacity_factor}, aux={config.model.aux_loss_weight}, "
                   f"z={config.model.router_z_loss_weight}")
         print(f"Data: {config.data_dir}, SeqLen={config.sequence_length}, Device={config.device}, bf16={use_bf16}")
-        print(f"Batch={config.batch_size}, Accum={config.gradient_accumulation_steps}, LR={config.learning_rate}")
-        print("-" * 60)
+        print(f"Batch={config.batch_size} (per GPU), Accum={config.gradient_accumulation_steps}, "
+              f"GlobalBatch≈{config.batch_size * config.gradient_accumulation_steps * world_size}")
+        print("-" * 72)
 
     # W&B
+    wandb = None
     if is_master and config.wandb_project:
-        import wandb
+        import wandb as _wandb
+        wandb = _wandb
         wandb.init(project=config.wandb_project, entity=config.wandb_entity,
                    name=config.wandb_run_name, config=asdict(config))
 
@@ -253,6 +296,13 @@ def train(config_path: str):
 
     # Model
     model = LunarisCodex(config.model).to(config.device, dtype=torch.bfloat16 if use_bf16 else torch.float32)
+
+    # Compute & announce active parameters per token (constant given K, E)
+    if is_master:
+        active_params, total_params = compute_active_params_per_token(model)
+        ratio = active_params / max(1, total_params)
+        print(f"[MODEL] Trainable params: {total_params:,} | Active per token (est.): {active_params:,} "
+              f"({ratio:.2%} of total)")
 
     # Optional compile
     if config.compile_model and device_type == 'cuda':
@@ -294,23 +344,47 @@ def train(config_path: str):
 
     if is_master:
         print(f"\n[TRAIN] Starting at step {current_step} up to {config.max_steps} ...")
-        pbar = tqdm(total=config.max_steps, desc="Steps", initial=current_step, ncols=120)
+        pbar = tqdm(total=config.max_steps, desc="Steps", initial=current_step, ncols=140)
+
+    # Log initial static metadata to W&B (active params per token)
+    if is_master and wandb is not None:
+        active_params, total_params = compute_active_params_per_token(raw_model)
+        wandb.log({
+            "meta/active_params_per_token": active_params,
+            "meta/total_trainable_params": total_params,
+            "meta/active_params_ratio": active_params / max(1, total_params),
+            "step": current_step,
+            "epoch": current_epoch,
+        })
 
     # Training loop
     data_iter = iter(train_loader)
+
+    # Throughput accumulators (reset each log window)
+    last_log_time = time.time()
+    tokens_since_log_local = 0  # local rank tokens
+    samples_since_log_local = 0
+    steps_since_log = 0
+    # Buffer expert indices for visualization
+    expert_indices_window: List[torch.Tensor] = []
+
+    step_start_wall = time.time()
+
     while current_step < config.max_steps:
         current_step += 1
+        steps_since_log += 1
         # LR schedule
         lr = get_lr(current_step, config)
         for pg in optimizer.param_groups:
             pg['lr'] = lr
 
-        # Accumulators for logging
+        # Accumulators for logging (losses averaged over grad-accum)
         accum_total = 0.0
         accum_main = 0.0
         accum_aux = 0.0
-        # For expert routing logs (first MoC layer)
-        first_layer_expert_indices = None  # [B, T, K]
+
+        # For capturing expert routing across micros in this step (layer 0)
+        step_expert_indices: List[torch.Tensor] = []
 
         for micro in range(config.gradient_accumulation_steps):
             is_last_micro = (micro == config.gradient_accumulation_steps - 1)
@@ -318,16 +392,42 @@ def train(config_path: str):
 
             with ddp_context:
                 try:
-                    x, y = next(data_iter)
+                    batch = next(data_iter)
                 except StopIteration:
                     current_epoch += 1
                     if is_ddp:
                         train_sampler.set_epoch(current_epoch)
                     data_iter = iter(train_loader)
-                    x, y = next(data_iter)
+                    batch = next(data_iter)
 
-                x = x.to(config.device, non_blocking=True)
-                y = y.to(config.device, non_blocking=True)
+                # Unpack dataset output; supports (x,y) or (x,y,valid_len_y)
+                valid_y_len = None
+                if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                    x, y, valid_y_len = batch
+                else:
+                    x, y = batch
+
+                # Move & cast ONLY on device per requirement
+                x = x.to(config.device, dtype=torch.long, non_blocking=True)
+                y = y.to(config.device, dtype=torch.long, non_blocking=True)
+
+                # Apply ignore_index=-1 for padded targets on GPU using valid_len_y if provided
+                if valid_y_len is not None:
+                    if not torch.is_tensor(valid_y_len):
+                        valid_y_len = torch.tensor(valid_y_len)
+                    valid_y_len = valid_y_len.to(config.device)
+                    Tlen = y.size(1)
+                    ar = torch.arange(Tlen, device=config.device).unsqueeze(0)
+                    pad_mask = ar >= valid_y_len.unsqueeze(1)
+                    # Clone to avoid in-place on shared storage across workers
+                    y = y.clone()
+                    y[pad_mask] = -1
+
+                # Tokens and samples accounting for throughput (local rank)
+                # Count only valid tokens (ignore_index != -1)
+                local_valid_tokens = int((y != -1).sum().item())
+                tokens_since_log_local += local_valid_tokens
+                samples_since_log_local += x.size(0)
 
                 with autocast_ctx:
                     logits, loss_tuple, _, aux_list = model(x, targets=y, past_key_values=None)
@@ -343,14 +443,21 @@ def train(config_path: str):
                 if aux_loss is not None:
                     accum_aux += float(aux_loss.item()) / config.gradient_accumulation_steps
 
-                # Capture first MoC layer routing indices when available
-                # model_moc_v2 returns aux_list = [expert_indices_list] (no keep_mask returned)
+                # Capture first MoC layer routing indices when available (accumulate for windowed viz)
                 if aux_list is not None and isinstance(aux_list, list) and len(aux_list) == 1:
                     indices_list = aux_list[0]
-                    if indices_list and first_layer_expert_indices is None:
-                        first_layer_expert_indices = indices_list[0].detach()  # [B, T, K]
+                    if indices_list:
+                        step_expert_indices.append(indices_list[0].detach().to("cpu"))  # [B, T, K] from layer 0
 
                 total_loss.backward()
+
+        # Merge step indices into visualization window buffer
+        if len(step_expert_indices) > 0:
+            try:
+                expert_indices_window.append(torch.cat(step_expert_indices, dim=0))
+            except Exception:
+                # Fallback if shapes mismatch across micros (shouldn't happen normally)
+                expert_indices_window.extend(step_expert_indices)
 
         # Clip and step
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
@@ -360,7 +467,37 @@ def train(config_path: str):
         # Logging
         if is_master:
             pbar.update(1)
-            if current_step % config.log_interval == 0:
+            do_log = (current_step % config.log_interval == 0)
+            if do_log:
+                now = time.time()
+                elapsed = max(1e-6, now - last_log_time)
+
+                # Aggregate tokens across all ranks for global throughput via all_reduce
+                tokens_tensor = torch.tensor([tokens_since_log_local], device=config.device, dtype=torch.float64)
+                if is_ddp:
+                    torch.distributed.all_reduce(tokens_tensor, op=torch.distributed.ReduceOp.SUM)
+                tokens_since_log_global = float(tokens_tensor.item())
+
+                # Compute throughputs
+                tok_per_s_global = tokens_since_log_global / elapsed
+                tok_per_s_per_gpu = tok_per_s_global / max(1, world_size)
+                samp_per_s_local = samples_since_log_local / elapsed
+
+                # ETA
+                steps_remaining = max(0, config.max_steps - current_step)
+                # Average seconds per step over this window
+                sec_per_step = elapsed / max(1, steps_since_log)
+                eta_sec = steps_remaining * sec_per_step
+                eta_h = int(eta_sec // 3600)
+                eta_m = int((eta_sec % 3600) // 60)
+
+                # Memory snapshot (CUDA only)
+                mem_cur_gb = mem_max_gb = 0.0
+                if device_type == 'cuda' and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    mem_cur_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+                    mem_max_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
                 ppl = math.exp(accum_main) if accum_main < 20 else float('inf')
                 pbar.set_postfix({
                     "loss": f"{accum_total:.3f}",
@@ -369,10 +506,14 @@ def train(config_path: str):
                     "ppl": f"{ppl:.2f}",
                     "lr": f"{lr:.2e}",
                     "gnorm": f"{float(grad_norm):.2f}",
+                    "tok/s(g)": f"{tok_per_s_global:,.0f}",
+                    "tok/s(gpu)": f"{tok_per_s_per_gpu:,.0f}",
+                    "samp/s(gpu)": f"{samp_per_s_local:,.1f}",
+                    "mem(GiB)": f"{mem_cur_gb:.2f}/{mem_max_gb:.2f}",
+                    "ETA": f"{eta_h}h{eta_m:02d}m",
                 })
 
-                if config.wandb_project:
-                    import wandb
+                if wandb is not None:
                     log_data = {
                         "step": current_step,
                         "epoch": current_epoch,
@@ -382,36 +523,87 @@ def train(config_path: str):
                         "perplexity": ppl,
                         "lr": lr,
                         "grad_norm": float(grad_norm),
+                        "throughput/tok_per_s_global": tok_per_s_global,
+                        "throughput/tok_per_s_per_gpu": tok_per_s_per_gpu,
+                        "throughput/samples_per_s_local": samp_per_s_local,
+                        "timing/sec_per_step_window": sec_per_step,
+                        "timing/eta_sec": eta_sec,
+                        "mem/current_gib": mem_cur_gb,
+                        "mem/max_gib": mem_max_gb,
                     }
 
-                    # Expert utilization (top-k): flatten [B, T, K] -> [B*T*K] before bincount
-                    if first_layer_expert_indices is not None:
-                        num_experts = int(raw_model.config.n_experts or 0)
-                        if num_experts > 0:
-                            flat_idx = first_layer_expert_indices.reshape(-1)  # [B*T*K]
-                            counts = torch.bincount(flat_idx, minlength=num_experts)
-                            total_pairs = counts.sum().clamp_min(1)
-                            util = counts.float() / total_pairs
-                            # per-expert utilization
-                            for i in range(num_experts):
-                                log_data[f"experts/util_layer0/e{i}"] = util[i].item()
+                    # --- Architectural visual logs: Expert utilization & co-occurrence (layer 0) ---
+                    # Aggregate indices across window
+                    if len(expert_indices_window) > 0:
+                        try:
+                            all_idx = torch.cat(expert_indices_window, dim=0)  # [N, T, K]
+                            E = int(getattr(raw_model.config, "n_experts", 0) or 0)
+                            if E > 0:
+                                flat_idx = all_idx.reshape(-1)
+                                counts = torch.bincount(flat_idx, minlength=E).float()
+                                total_pairs = counts.sum().clamp_min(1.0)
+                                util = (counts / total_pairs).cpu().numpy()
 
-                            # Token-expert pair drop rate (approximated via capacity factor)
-                            # Compute capacity per expert for this batch:
-                            # N_pairs = B*T*K; C = ceil((N_pairs / E) * capacity_factor)
-                            # dropped_pairs_e = max(0, counts[e] - C)
-                            # drop_rate = sum(dropped_pairs_e) / N_pairs
-                            E = num_experts
-                            Bsz, Tlen, K = first_layer_expert_indices.shape
-                            N_pairs = (Bsz * Tlen * K)
-                            C = int(math.ceil((N_pairs / max(1, E)) * raw_model.config.capacity_factor))
-                            dropped = (counts - C).clamp_min(0)
-                            drop_rate = dropped.sum().float() / float(max(1, N_pairs))
-                            log_data["experts/drop_rate_layer0"] = drop_rate.item()
+                                # W&B scalars for quick glance
+                                for i in range(E):
+                                    log_data[f"experts/util_layer0/e{i}"] = float(util[i])
+
+                                # Pairwise co-occurrence heatmap when top_k >= 2
+                                k_sel = all_idx.shape[-1]
+                                if k_sel >= 2 and plt is not None and wandb is not None:
+                                    cooc = torch.zeros(E * E, dtype=torch.int64)
+                                    idx2d = all_idx.view(-1, k_sel)  # [M, K]
+                                    for i in range(k_sel):
+                                        for j in range(i + 1, k_sel):
+                                            u = idx2d[:, i]
+                                            v = idx2d[:, j]
+                                            flat = (u * E + v)
+                                            co = torch.bincount(flat, minlength=E * E)
+                                            cooc += co
+                                            # Symmetrize (u,v) and (v,u)
+                                            cooc += co.reshape(E, E).t().reshape(-1)
+                                    cooc_mat = cooc.reshape(E, E).cpu().numpy()
+
+                                    # Plot utilization bar and co-occurrence heatmap side-by-side
+                                    fig = plt.figure(figsize=(10, 4), constrained_layout=True)
+                                    gs = fig.add_gridspec(1, 2, width_ratios=[1, 1.2])
+
+                                    ax0 = fig.add_subplot(gs[0, 0])
+                                    ax0.bar(np.arange(E), util)
+                                    ax0.set_title("Layer 0: Expert Utilization (window)")
+                                    ax0.set_xlabel("Expert id")
+                                    ax0.set_ylabel("Fraction of routed pairs")
+
+                                    ax1 = fig.add_subplot(gs[0, 1])
+                                    im = ax1.imshow(cooc_mat, aspect="auto", interpolation="nearest")
+                                    ax1.set_title("Layer 0: Expert Pair Co-occurrence")
+                                    ax1.set_xlabel("Expert v")
+                                    ax1.set_ylabel("Expert u")
+                                    fig.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+
+                                    log_data["viz/layer0_expert_util_cooc"] = wandb.Image(fig)
+                                    plt.close(fig)
+
+                        except Exception as viz_err:
+                            # Non-fatal: annotate in logs for visibility
+                            log_data["viz/error"] = str(viz_err)
+
+                    # Log constant active params per token periodically for visibility
+                    active_params, total_params = compute_active_params_per_token(raw_model)
+                    log_data["meta/active_params_per_token"] = active_params
+                    log_data["meta/total_trainable_params"] = total_params
+                    log_data["meta/active_params_ratio"] = active_params / max(1, total_params)
 
                     wandb.log(log_data)
 
-        # Checkpointing
+                # Reset window accumulators
+                last_log_time = now
+                tokens_since_log_local = 0
+                samples_since_log_local = 0
+                steps_since_log = 0
+                expert_indices_window.clear()
+
+        # Checkpointing (save twice per requirement)
         if is_master and current_step % config.save_interval == 0:
             ckpt = {
                 'model': (raw_model.state_dict()),
@@ -420,27 +612,27 @@ def train(config_path: str):
                 'step': current_step,
                 'epoch': current_epoch,
             }
+            # 1) Numbered checkpoint
             save_path = os.path.join(config.out_dir, f"ckpt_{current_step}.pt")
             torch.save(ckpt, save_path)
-            if config.save_latest_always:
-                latest_path = os.path.join(config.out_dir, "latest_checkpoint.pt")
-                torch.save(ckpt, latest_path)
-            print(f"\n[CKPT] Saved checkpoint: {save_path}")
+            # 2) Latest checkpoint (always save, regardless of config.save_latest_always)
+            latest_path = os.path.join(config.out_dir, "latest_checkpoint.pt")
+            torch.save(ckpt, latest_path)
+            print(f"\n[CKPT] Saved checkpoints: {save_path}  |  {latest_path}")
 
     # Finalize
     if is_master:
         print("\n[TRAIN] Max steps reached. Finishing.")
-        pbar.close()
-        if config.wandb_project:
-            import wandb
+        if wandb is not None:
             wandb.finish()
+        pbar.close()
     if is_ddp:
         destroy_process_group()
 
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description="Train a LunarisCodex MoC v2 model (top-k collaborative experts).")
+    parser = argparse.ArgumentParser(description="Train a LunarisCodex MoC model (top-k collaborative experts).")
     parser.add_argument("config", type=str, help="Path to the config.yaml file.")
     args = parser.parse_args()
     train(args.config)
