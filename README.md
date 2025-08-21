@@ -76,7 +76,7 @@ This raises effective depth at small extra cost, often smoothing optimization an
 * **Auxiliary losses** (applied to router outputs):
 
   * **Balance loss** encourages uniform expert utilization over a batch/window.
-  * **Z‑loss** regularizes the scale of router logits via $\mathbb{E}[\operatorname{logsumexp}(\text{logits})^2]$.
+  * **Z‑loss** regularizes the scale of router logits via `E[(logsumexp(logits))^2]`text{logits})^2]).
   * **Drop penalty** (optional) adds a small cost proportional to the fraction of dropped token–expert pairs.
 
 ### Backbone
