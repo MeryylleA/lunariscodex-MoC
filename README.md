@@ -1,27 +1,27 @@
-# Lunaris MoC — Mixture of Collaboration with IRL
+# Lunaris MoC — Mixture‑of‑Collaboration with Iterative Reasoning Loops
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/MeryylleA/lunariscodex-MoC)
 
-Lunaris MoC is a research‑grade, production‑oriented Transformer with **Mixture‑of‑Collaboration (MoC)** blocks and **Iterative Reasoning Loops (IRL)**. The core idea: per‑token **routing selects K paths**, these paths **collaborate** (exchange information) before a **learned fusion** produces the block output. Inside each path, a lightweight **IRL** performs a few refinement steps without adding parameters.
+**Lunaris MoC** is a research‑grade, production‑minded Transformer featuring **Mixture‑of‑Collaboration (MoC)** blocks and **Iterative Reasoning Loops (IRL)**. Each token is *routed* to a small **Top‑K** set of experts; those expert states **collaborate** (exchange information) before a **learned fusion** produces the block output. Inside each expert, a lightweight **IRL** performs a few refinement steps to deepen computation without adding parameters.
 
 This repository contains:
 
-* `model_moc.py` — the architecture (**LunarisCodex**) and configuration.
-* `train_moc.py` — a scalable training script (DDP‑ready, bf16, fused AdamW, checkpointing, logging).
+* `model_moc.py` — the model architecture (**LunarisCodex**) and configuration.
+* `train_moc.py` — the training script (DDP‑ready, bf16, fused AdamW, checkpointing, rich logging).
 
-> **Status**: mainline, ready for training and experimentation.
+> **Status**: mainline; actively used for training and experimentation.
 
 ---
 
 ## Table of Contents
 
-* [Key Concepts](#key-concepts)
+* [Key Ideas](#key-ideas)
 
   * [MoC (Mixture of Collaboration)](#moc-mixture-of-collaboration)
   * [IRL (Iterative Reasoning Loops)](#irl-iterative-reasoning-loops)
-  * [Routing, Capacity, and Auxiliary Losses](#routing-capacity-and-auxiliary-losses)
-  * [Backbone: Attention & Positional Encoding](#backbone-attention--positional-encoding)
+  * [Routing, Capacity & Auxiliary Losses](#routing-capacity--auxiliary-losses)
+  * [Backbone](#backbone)
 * [Quickstart](#quickstart)
 
   * [Environment](#environment)
@@ -31,64 +31,61 @@ This repository contains:
 * [Training Details](#training-details)
 
   * [Precision & Performance](#precision--performance)
-  * [Distributed Training](#distributed-training)
+  * [Distributed Training (DDP)](#distributed-training-ddp)
   * [Checkpointing & Resume](#checkpointing--resume)
-  * [Logging & Metrics](#logging--metrics)
+  * [Logging & Metrics Reference](#logging--metrics-reference)
 * [Inference](#inference)
-
-  * [Practical Tips](#practical-tips)
 * [FAQ](#faq)
 * [License](#license)
-* [Community](#community)
 
 ---
 
-## Key Concepts
+## Key Ideas
 
 ### MoC (Mixture of Collaboration)
 
-**What it is.** A drop‑in replacement for the usual FFN block. For each token, a small **Top‑K** subset of paths ("experts") is selected by a learned router. Unlike classical MoE, MoC makes experts **talk to each other** *before* fusing.
+**What**: A collaborative alternative to vanilla MoE. For each token, a learned **router** picks **Top‑K experts**. Rather than processing them independently, MoC lets those expert states **talk to each other** before fusing them.
 
-**How it works (per token):**
+**Per‑token flow**:
 
-1. **Routing (fp32):** compute logits → pick Top‑K experts; keep full‑distribution `router_probs` for losses.
-2. **Capacity control:** each expert gets a bounded number of token‑assignments; excess pairs are dropped (counted and optionally penalized).
-3. **Expert compute:** each selected expert runs its **IRL FFN** on the token state.
-4. **Collaboration:** run **R rounds of MHA + FFN** across the *K expert states* (optionally add a learnable **mediator** token). This exchanges information among paths.
-5. **Fusion:** a small **gate** mixes the mediator output with the probability‑weighted sum of expert states.
+1. **Routing (fp32)**: compute router logits → select Top‑K experts; keep full probability distribution for losses/metrics.
+2. **Capacity control**: each expert accepts up to a capacity; excess token–expert assignments are dropped (counted and optionally penalized).
+3. **Expert compute**: each selected expert runs its **IRL FFN** on the token state.
+4. **Collaboration**: run **R rounds** of attention/MLP across the **K expert states** (optionally with a learnable **mediator** token) to exchange information.
+5. **Fusion**: a small **gate** mixes mediator output with the probability‑weighted sum of expert states.
 
-**Why.** Collaboration counters the “isolation” problem of MoE and improves **credit assignment** across complementary sub‑skills.
+**Why**: Collaboration addresses the “expert isolation” issue in classic MoE and improves credit assignment across complementary sub‑skills.
 
 ### IRL (Iterative Reasoning Loops)
 
-Inside each expert/FFN, compute **S micro‑steps**:
+Inside each expert FFN, apply **S micro‑steps** that refine the hidden state:
 
-```
-h0 = x
-for s in 1..S:
-    h = h + α · FFN(h + x)        # α ≈ 1/√S
+```python
+h = x
+for s in range(S):
+    h = h + α * FFN(h + x)   # α ≈ 1/√S
 return h
 ```
 
-This increases effective depth with minimal overhead. It tends to smooth optimization and can help compositional behavior.
+This raises effective depth at small extra cost, often smoothing optimization and helping compositional behavior.
 
-### Routing, Capacity, and Auxiliary Losses
+### Routing, Capacity & Auxiliary Losses
 
-* **Top‑K routing:** selects experts per token; probabilities used for balancing.
-* **Capacity factor:** limits token‑expert pairs per expert; overflow pairs are dropped deterministically.
-* **Auxiliary losses:**
+* **Top‑K routing** per token with probabilities used beyond the argmax for regularization and metrics.
+* **Capacity factor** bounds token–expert pairs per expert. Overflow pairs are **dropped** deterministically; the fraction is tracked.
+* **Auxiliary losses** (applied to router outputs):
 
-  * **Balance loss** encourages uniform expert utilization.
-  * **Z‑loss** regularizes the router logits via `mean(logsumexp(logits)^2)`.
-  * **Drop penalty** (optional) adds a small cost proportional to the fraction of dropped pairs.
+  * **Balance loss** encourages uniform expert utilization over a batch/window.
+  * **Z‑loss** regularizes the scale of router logits via $\mathbb{E}[\operatorname{logsumexp}(\text{logits})^2]$.
+  * **Drop penalty** (optional) adds a small cost proportional to the fraction of dropped token–expert pairs.
 
-### Backbone: Attention & Positional Encoding
+### Backbone
 
-* **Decoder‑only Transformer**, Pre‑LN with **RMSNorm**.
+* Decoder‑only Transformer, Pre‑LN with **RMSNorm**.
 * **RoPE** positional encoding.
-* **GQA** attention (grouped KV heads) with **scaled dot‑product attention (Flash/SDPA)**.
+* **GQA** attention (grouped KV heads) via PyTorch **SDPA/Flash** kernels.
 * **SwiGLU‑style** MLP where FFN is used.
-* **Tied embeddings** (`wte` and `lm_head`).
+* **Tied embeddings** between token embeddings and output head.
 
 ---
 
@@ -108,8 +105,10 @@ pip install -r requirements.txt
 `train_moc.py` expects pre‑tokenized shards stored as `.npy` arrays of token IDs. The loader memory‑maps shards and emits sequences of length `max_seq_len`.
 
 1. **Tokenize** your corpus with a BPE tokenizer (HF `tokenizers`, SentencePiece, etc.). Append an end‑of‑text token per document.
-2. **Concatenate** token IDs and split into shard files (e.g., `tokens_000.npy`, `tokens_001.npy`, ...). Any integer dtype is fine; the loader casts to `int64`.
+2. **Concatenate** token IDs and split into shard files (e.g., `tokens_000.npy`, `tokens_001.npy`, ...). Any integer dtype is fine; casting to `int64` happens **on GPU**.
 3. Place shards under `data/` (or set `data_dir` in the config).
+
+> Padding/targets: the dataset yields `(x, y, valid_len_y)`. Targets beyond `valid_len_y` are set to `ignore_index=-1` **on GPU** to avoid CPU‑side dtype promotion.
 
 ### Configuration
 
@@ -126,7 +125,7 @@ model:
   max_seq_len: 2048
   dropout: 0.05
 
-  # MoC
+  # MoC routing
   n_experts: 8
   top_k: 2
   capacity_factor: 1.25
@@ -134,7 +133,7 @@ model:
   router_z_loss_weight: 1.0e-3
   router_noise_std: 0.0
 
-  # Collaboration (message passing among experts)
+  # Collaboration among experts
   use_simple_collab: false
   use_moc_collab: true
   moc_collab_steps: 2
@@ -142,7 +141,7 @@ model:
   moc_collab_heads: 4
   moc_collab_dropout: 0.0
 
-  # IRL
+  # IRL steps inside each expert
   n_reasoning_steps: 2
 
   # Engineering
@@ -171,6 +170,8 @@ wandb_project: "lunaris-moc"
 wandb_run_name: "moc-1024d-8x-top2-irl2-collab2"
 ```
 
+> The `TrainConfig.from_yaml()` path supplies sensible defaults if some MoC fields are omitted (e.g., `top_k`, `capacity_factor`, `aux_loss_weight`, `router_z_loss_weight`).
+
 ### Launch Training
 
 Single node (will use all visible GPUs via `torchrun`):
@@ -185,36 +186,63 @@ torchrun --standalone --nproc_per_node=auto train_moc.py train.yaml
 
 ### Precision & Performance
 
-* **bf16 autocast** on supported GPUs; attention uses **Flash/SDPA** kernels.
-* **TF32** matmuls enabled by default on Ampere+.
-* **Fused AdamW** used when available.
-* Optional `torch.compile()` path with safe fallback.
+* **bf16 autocast** on supported GPUs; attention uses **SDPA/Flash** kernels.
+* **TF32** matmuls enabled on Ampere+.
+* **Fused AdamW** when available.
+* Optional `torch.compile()` with safe fallback.
 
-### Distributed Training
+### Distributed Training (DDP)
 
-* **DDP** is integrated; `torchrun` sets up ranks and local devices.
-* The dataloader uses a **DistributedSampler** when DDP is active.
+* **DDP** integrated via `torchrun`; uses `no_sync()` during gradient accumulation.
+* `DistributedSampler` ensures shard coverage across ranks.
 * Gradient accumulation and gradient clipping are built in.
 
 ### Checkpointing & Resume
 
-* Periodic checkpoints at `save_interval` and a rolling `latest_checkpoint.pt`.
-* Resuming restores model/optimizer state and training step/epoch.
+* Periodic checkpoints at `save_interval`.
+* The trainer **saves twice** each time: a numbered `ckpt_<step>.pt` and a rolling `latest_checkpoint.pt`.
+* Resuming restores model weights, optimizer state, and step/epoch counters.
 
-### Logging & Metrics
+### Logging & Metrics Reference
 
-* Losses: **total**, **main (CE)**, **aux**; derived **perplexity**.
-* **Learning rate** and **grad‑norm**.
-* **Expert utilization** (per‑expert frequency for the first MoC layer) and **approximate drop rate**.
-* If `wandb_project` is set, metrics are logged to Weights & Biases.
+The trainer prints concise console stats and (optionally) logs to **Weights & Biases** with the keys below. Where helpful, a short definition is provided.
+
+#### Core losses & optimization
+
+* **`loss/total`** — sum of main cross‑entropy loss and auxiliary router losses.
+* **`loss/main`** — token cross‑entropy (ignores positions with target `-1`).
+* **`loss/aux`** — sum of balance, z‑loss, and (if enabled) drop penalty.
+* **`perplexity`** — `exp(loss/main)`; clipped to avoid overflow in logs.
+* **`lr`** — learning rate (cosine decay with warmup; floor at 1% of peak).
+* **`grad_norm`** — global gradient norm after clipping.
+
+#### Router behavior (MoC)
+
+* **`experts/util_layer0/e<i>`** — fraction of routed token–expert pairs that selected expert *i* (first MoC layer). Healthy training shows reasonably uniform utilization over time.
+* **`experts/drop_rate_layer0`** *(if enabled)* — approximate fraction of token–expert pairs that were **dropped** by capacity in the first MoC layer. Computation:
+
+  * Let **E** be the number of experts, **K** the Top‑K, and **N** the number of tokens in the batch. Then **N\_pairs = N × K**.
+  * Capacity per expert **C = ceil((N\_pairs / E) × capacity\_factor)**.
+  * For per‑expert counts $c_e$, **drop\_rate = Σ\_e max(0, c\_e − C) / N\_pairs**.
+* **`viz/layer0_expert_util_cooc`** *(image, if plotting is available)* — side‑by‑side plots of (1) expert utilization bars and (2) pairwise expert **co‑occurrence** heatmap across the logging window. Useful to detect persistent expert couplings.
+* **`meta/active_params_per_token`**, **`meta/total_trainable_params`**, **`meta/active_params_ratio`** — estimate of how many parameters are **active per token** given MoC’s Top‑K routing, relative to the full parameter count.
+
+#### Throughput & system (when enabled)
+
+* **`throughput/tok_per_s_global`** — aggregated tokens/sec across all ranks (via all‑reduce).
+* **`throughput/tok_per_s_per_gpu`** — tokens/sec per GPU.
+* **`throughput/samples_per_s_local`** — samples/sec on the local rank (for quick sanity checks).
+* **`timing/sec_per_step_window`** — average seconds/step over the recent log window.
+* **`timing/eta_sec`** — estimated seconds to completion given the current window speed.
+* **`mem/current_gib`**, **`mem/max_gib`** — current and peak CUDA memory (GiB) since start.
+
+> **Tips**: A stable run typically shows (a) slowly decreasing `loss/main`, (b) near‑uniform expert utilization, (c) low and stable drop rate at reasonable `capacity_factor`, and (d) smooth throughput without oscillations from host I/O.
 
 ---
 
 ## Inference
 
-### Greedy/Top‑k Generation
-
-`LunarisCodex.generate()` supports cached decoding with optional temperature and `top_k`:
+Basic greedy/Top‑k generation with cached decoding:
 
 ```python
 from model_moc import LunarisCodex, LunarisCodexConfig
@@ -227,35 +255,28 @@ model = LunarisCodex(cfg).eval().cuda()
 out = model.generate(idx, max_new_tokens=64, temperature=0.8, top_k=50)
 ```
 
-### Practical Tips
+**Practical tips**
 
-* Keep `use_cache` on (the implementation uses `past_key_values`).
-* For latency‑sensitive serving, reduce collaboration/IRL rounds at decode time if your setup exposes such knobs.
-* Prefer BF16 weights and KV cache (or FP16) during inference for memory efficiency.
+* Keep `use_cache=True` for fast decoding.
+* For latency‑sensitive serving, you can reduce collaboration or IRL rounds at decode time if your setup surfaces such knobs.
+* Prefer bf16 weights and KV cache (or fp16) during inference to conserve memory.
 
 ---
 
 ## FAQ
 
-**Is this MoE?**  It uses routing like MoE, but the selected paths **collaborate before fusion**; experts aren’t isolated.
+**Is this just MoE?**  MoC uses a router like MoE, but experts **collaborate before fusion**, which changes optimization and sample efficiency.
 
-**Do I need custom CUDA kernels?**  Not required. The model runs on stock PyTorch (SDPA/Flash attention). Custom kernels can improve throughput but are optional.
+**Do I need custom CUDA kernels?**  No. The model runs on stock PyTorch (SDPA/Flash attention). Custom kernels can improve throughput but are optional.
 
-**Can I train with mixed precision?**  Yes — bf16 autocast is supported.
+**How do I monitor expert behavior?**  Watch `experts/util_layer0/e<i>` and, if enabled, `experts/drop_rate_layer0`. The co‑occurrence heatmap is a powerful qualitative signal.
 
-**How do I monitor expert behavior?**  Check the logged **expert utilization** and **drop rate** metrics. Uniform utilization and low, stable drop rates are healthy signs.
+**Can I train with mixed precision?**  Yes — bf16 autocast is supported and recommended on recent GPUs.
 
-**How big can I scale this?**  The trainer is DDP‑ready and has been used on multi‑GPU nodes. For very large clusters, you can integrate engines like Megatron‑DeepSpeed while keeping this model class.
+**How big can I scale this?**  The trainer is DDP‑ready and has been used on multi‑GPU nodes. For larger clusters, you can integrate external engines while keeping `LunarisCodex` intact.
 
 ---
 
 ## License
 
 Apache License 2.0 — see `LICENSE`.
-
----
-
-## Community
-
-* Author: **Francisco Antonio** (GitHub `@MeryylleA`)
-* Focus: iterative reasoning, collaborative expert systems, efficient pretraining.
