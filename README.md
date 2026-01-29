@@ -1,42 +1,56 @@
+<div align="center">
+
 # Lunaris MoC — Mixture‑of‑Collaboration with Iterative Reasoning Loops
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Paper](https://img.shields.io/badge/Paper-PDF-red?style=flat-square&logo=adobe-acrobat-reader)](docs/main.pdf)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/MeryylleA/lunariscodex-MoC)
+[![HuggingFace](https://img.shields.io/badge/🤗%20Datasets-meryyllebr543-yellow?style=flat-square)](https://huggingface.co/meryyllebr543)
 
-**Lunaris MoC** is a research‑grade, production‑minded Transformer featuring **Mixture‑of‑Collaboration (MoC)** blocks and **Iterative Reasoning Loops (IRL)**. Each token is *routed* to a small **Top‑K** set of experts; those expert states **collaborate** (exchange information) before a **learned fusion** produces the block output. Inside each expert, a lightweight **IRL** performs a few refinement steps to deepen computation without adding parameters.
+**A research‑grade, production‑minded Transformer developed independently by a 17‑year‑old researcher from Brazil 🇧🇷**
+
+[📄 Read the Paper](docs/main.pdf) • [🤗 Explore Datasets](https://huggingface.co/meryyllebr543) • [DeepWiki Docs](https://deepwiki.com/MeryylleA/lunariscodex-MoC)
+
+</div>
+
+---
+
+## Overview
+
+**Lunaris MoC** is a decoder‑only Transformer featuring **Mixture‑of‑Collaboration (MoC)** blocks and **Iterative Reasoning Loops (IRL)**. Each token is *routed* to a small **Top‑K** set of experts; those expert states **collaborate** (exchange information) before a **learned fusion** produces the block output. Inside each expert, a lightweight **IRL** performs a few refinement steps to deepen computation without adding parameters.
 
 This repository contains:
 
 * `model_moc.py` — the model architecture (**LunarisCodex**) and configuration.
 * `train_moc.py` — the training script (DDP‑ready, bf16, fused AdamW, checkpointing, rich logging).
 
-> **Status**: mainline; actively used for training and experimentation.
+> **Status**: Mainline; actively used for training and experimentation. Seeking collaborators for large‑scale benchmarking.
 
 ---
 
-## Table of Contents
+## Paper & Citation
 
-* [Key Ideas](#key-ideas)
+This repository contains the official implementation of the paper:  
+**"Lunaris MoC: Mixture‑of‑Collaboration with Iterative Reasoning Loops"**  
+📥 [Download PDF](docs/main.pdf)
 
-  * [MoC (Mixture of Collaboration)](#moc-mixture-of-collaboration)
-  * [IRL (Iterative Reasoning Loops)](#irl-iterative-reasoning-loops)
-  * [Routing, Capacity & Auxiliary Losses](#routing-capacity--auxiliary-losses)
-  * [Backbone](#backbone)
-* [Quickstart](#quickstart)
+If you use this code or architecture in your research, please cite:
 
-  * [Environment](#environment)
-  * [Data Preparation](#data-preparation)
-  * [Configuration](#configuration)
-  * [Launch Training](#launch-training)
-* [Training Details](#training-details)
+```bibtex
+@article{antonio2024lunaris,
+  title={Lunaris MoC: Mixture-of-Collaboration with Iterative Reasoning Loops},
+  author={Antonio, Francisco},
+  year={2024},
+  url={https://github.com/MeryylleA/lunariscodex-MoC}
+}
+```
 
-  * [Precision & Performance](#precision--performance)
-  * [Distributed Training (DDP)](#distributed-training-ddp)
-  * [Checkpointing & Resume](#checkpointing--resume)
-  * [Logging & Metrics Reference](#logging--metrics-reference)
-* [Inference](#inference)
-* [FAQ](#faq)
-* [License](#license)
+---
+
+## Research Artifacts
+
+Beyond the code, this project includes **9 curated datasets** specifically designed to stress‑test MoE routing, expert specialization, and long‑context behavior under different capacity constraints:  
+👉 **[HuggingFace: meryyllebr543](https://huggingface.co/meryyllebr543)**
 
 ---
 
@@ -76,7 +90,7 @@ This raises effective depth at small extra cost, often smoothing optimization an
 * **Auxiliary losses** (applied to router outputs):
 
   * **Balance loss** encourages uniform expert utilization over a batch/window.
-  * **Z‑loss** regularizes the scale of router logits via `E[(logsumexp(logits))^2]`text{logits})^2]).
+  * **Z‑loss** regularizes the scale of router logits via `E[(logsumexp(logits))^2]`.
   * **Drop penalty** (optional) adds a small cost proportional to the fraction of dropped token–expert pairs.
 
 ### Backbone
@@ -263,17 +277,37 @@ out = model.generate(idx, max_new_tokens=64, temperature=0.8, top_k=50)
 
 ---
 
+## Project Status
+
+- [x] Architecture implementation & production‑ready training pipeline  
+- [x] 9 research datasets published on Hugging Face  
+- [x] Technical paper (PDF available in `docs/`)  
+- [ ] Large‑scale pre‑training benchmarks (*seeking compute sponsors*)  
+- [ ] Comprehensive evaluation suite (perplexity, downstream tasks, comparisons)  
+
+**Looking for**: GPU clusters or cloud credits for validation runs, co‑authors for benchmarking, and feedback on the collaboration mechanism from MoE researchers.
+
+---
+
 ## FAQ
 
-**Is this just MoE?**  MoC uses a router like MoE, but experts **collaborate before fusion**, which changes optimization and sample efficiency.
+**Is this just MoE?**  
+MoC uses a router like MoE, but experts **collaborate before fusion**, which changes optimization and sample efficiency.
 
-**Do I need custom CUDA kernels?**  No. The model runs on stock PyTorch (SDPA/Flash attention). Custom kernels can improve throughput but are optional.
+**How is this different from Switch Transformers or Mixtral?**  
+Switch and Mixtral use independent expert computation. Lunaris adds explicit communication between experts (collaboration rounds) and iterative refinement inside experts (IRL). Think "committee discussion" vs "individual voting."
 
-**How do I monitor expert behavior?**  Watch `experts/util_layer0/e<i>` and, if enabled, `experts/drop_rate_layer0`. The co‑occurrence heatmap is a powerful qualitative signal.
+**Do I need custom CUDA kernels?**  
+No. The model runs on stock PyTorch (SDPA/Flash attention). Custom kernels can improve throughput but are optional.
 
-**Can I train with mixed precision?**  Yes — bf16 autocast is supported and recommended on recent GPUs.
+**How do I monitor expert behavior?**  
+Watch `experts/util_layer0/e<i>` and, if enabled, `experts/drop_rate_layer0`. The co‑occurrence heatmap is a powerful qualitative signal.
 
-**How big can I scale this?**  The trainer is DDP‑ready and has been used on multi‑GPU nodes. For larger clusters, you can integrate external engines while keeping `LunarisCodex` intact.
+**Can I train with mixed precision?**  
+Yes — bf16 autocast is supported and recommended on recent GPUs.
+
+**How big can I scale this?**  
+The trainer is DDP‑ready and has been used on multi‑GPU nodes. For larger clusters, you can integrate external engines while keeping `LunarisCodex` intact.
 
 ---
 
