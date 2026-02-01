@@ -37,7 +37,7 @@ This repository contains the official implementation of the paper:
 If you use this code or architecture in your research, please cite:
 
 ```bibtex
-@article{Francisco Antonio,
+@article{LunarisMoC,
   title={Lunaris MoC: Mixture-of-Collaboration with Iterative Reasoning Loops},
   author={Franisco Antonio},
   year={2026},
